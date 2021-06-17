@@ -239,7 +239,7 @@ class VAE_HSC(VAE_Flow):
             inner_kernel=self.hmc_kernel, 
             num_adaptation_steps=self.num_samp, 
             target_accept_prob=0.75,
-            adaptation_rate=0.15)
+            adaptation_rate=0.1)
         self.hmc_points = self.pz.sample(train_size).numpy()
         self.is_accepted = 0
         self.is_accepted_list = []
@@ -257,6 +257,18 @@ class VAE_HSC(VAE_Flow):
         logdet = self.f_tot.forward_log_det_jacobian(z0, 1)
 
         return logpx_z + logpz + logdet
+
+    def reset_hmc_kernel(self, hmc_e):
+        self.hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
+            target_log_prob_fn=self.log_hmc_target,
+            step_size=np.float32(hmc_e),
+            num_leapfrog_steps=self.hmc_L,
+            state_gradients_are_stopped=True)
+        self.hmc_kernel = tfp.mcmc.SimpleStepSizeAdaptation(
+            inner_kernel=self.hmc_kernel, 
+            num_adaptation_steps=self.num_samp, 
+            target_accept_prob=0.75,
+            adaptation_rate=0.1)
     
     def get_current_state(self, idx):
         if not self.first_epoch:
@@ -342,22 +354,22 @@ class VAE_HSC(VAE_Flow):
         optimizer = tf.keras.optimizers.Adam(lr)
         for epoch in range(1, epochs + 1):
             print('-- Epoch {} --'.format(epoch))
-            start_time = datetime.datetime.now()
             idx = 0
+            self.adapted_step_sizes = []
             self.first_epoch = (epoch==1)
             for train_x in train_dataset:
+                start_time = datetime.datetime.now()
                 if idx >= stop_idx:
                     break
                 loss = self.train_step(train_x, optimizer, idx)
+                idx += self.batch_size
+                self.reset_hmc_kernel(tf.squeeze(self.adapted_step_sizes[-1]))
+                end_time = datetime.datetime.now()
                 if idx % (self.batch_size*1) == 0:
                     print('Loss', round(loss.numpy(), 3), 
-                          'acceptance rate', round(self.is_accepted, 3))
-                idx += self.batch_size
-            end_time = datetime.datetime.now()
-            print('adapted step sizes of the first and last batches: \n', 
-                self.adapted_step_sizes[0], self.adapted_step_sizes[-1])
-            self.adapted_step_sizes = []
-
+                          'accept rate', round(self.is_accepted, 3),
+                          'step size', np.round(np.squeeze(self.adapted_step_sizes[-1]), 3),
+                          'time', end_time-start_time)
             # Save generated images
             if generation:
                 util.generate_images_from_images(self, test_sample, 
