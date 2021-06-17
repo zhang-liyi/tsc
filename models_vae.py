@@ -204,7 +204,7 @@ class VAE_Flow(VAE):
 
             # Save generated images
             if generation:
-                util.generate_images_from_images(self, test_sample, 
+                util.generate_images_from_images(self, test_sample, flow=True,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
                 util.generate_images_from_random(self, random_vector_for_generation, 
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
@@ -372,7 +372,7 @@ class VAE_HSC(VAE_Flow):
                           'time', end_time-start_time)
             # Save generated images
             if generation:
-                util.generate_images_from_images(self, test_sample, 
+                util.generate_images_from_images(self, test_sample, flow=True,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
                 util.generate_images_from_random(self, random_vector_for_generation, 
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
