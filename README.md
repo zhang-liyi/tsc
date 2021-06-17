@@ -1,5 +1,9 @@
 # hsc
 
+Requires:
+* Tensorflow 2.x
+* Corresponding version of Tensorflow-Probability
+
 For a typical setting of VAE with HSC, we can run with:
 `python main.py --method=vae_hsc --epochs=300 --lr=0.0003 --batch_size=600 --latent_dim=2 --num_samp=1 --hmc_e=0.1 --hmc_L=1`
 
