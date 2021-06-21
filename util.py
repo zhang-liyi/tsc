@@ -55,30 +55,48 @@ def generate_images_from_images(model, test_sample, flow=False, path=None):
         z = model.flow(z)
     predictions = model.sample(z)
     fig = plt.figure(figsize=(4, 4))
-
     for i in range(predictions.shape[0]):
         plt.subplot(4, 4, i + 1)
         plt.imshow(predictions[i, :, :, 0], cmap='gray')
         plt.axis('off')
 
     # tight_layout minimizes the overlap between 2 sub-plots
-    plt.savefig(path)
-    plt.close()
+    if path is not None:
+        plt.savefig(path)
+        plt.close()
     
 def generate_images_from_random(model, rand_vec, path=None):
     predictions = model.sample(rand_vec)
     fig = plt.figure(figsize=(4, 4))
-
     for i in range(predictions.shape[0]):
         plt.subplot(4, 4, i + 1)
         plt.imshow(predictions[i, :, :, 0], cmap='gray')
         plt.axis('off')
 
     # tight_layout minimizes the overlap between 2 sub-plots
-    plt.savefig(path)
-    plt.close()
+    if path is not None:
+        plt.savefig(path)
+        plt.close()
 
-
+def plot_hmc_points(points, old_points=None, path=None):
+    if old_points is None:
+        plt.plot(points[0,0],points[0,1], 'o', label='pt 1')
+        plt.plot(points[1,0],points[1,1], 'o', label='pt 30001')
+        plt.plot(points[2,0],points[2,1], 'o', label='pt 60000')
+        plt.legend()
+        plt.savefig(path)
+        plt.close()
+        return np.expand_dims(points,0)
+    else:
+        points = np.concatenate((old_points, np.expand_dims(points, 0)))
+        plt.plot(points[:,0,0], points[:,0,1], label='pt 1')
+        plt.plot(points[:,1,0], points[:,1,1], label='pt 30001')
+        plt.plot(points[:,2,0], points[:,2,1], label='pt 60000')
+        plt.legend()
+        plt.savefig(path)
+        plt.close()
+        return points
+    
 
 class Funnel:
 
