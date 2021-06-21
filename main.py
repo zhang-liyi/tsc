@@ -56,6 +56,16 @@ def parse_args():
                        help='HMC number of leapfrog steps.',
                        type=int,
                        default=4)
+    parser.add_argument('--warm_up', 
+                       default=False, 
+                       type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--load_path',
+                       help='Define load_path if you want to load a trained model.',
+                       default='na')
+    parser.add_argument('--load_epoch',
+                       help='Which epoch do you want the loaded model to start trainig at.',
+                       type=int,
+                       default=1)
     args = parser.parse_args()
     return args
 
@@ -102,15 +112,20 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             test_sample=test_sample, random_vector_for_generation=random_vector_for_generation)
 
     if args.method.lower() == 'vae_hsc':
+        if args.load_path.lower() == 'na':
+            load_path = None
+        else:
+            load_path = args.load_path
         model = models_vae.VAE_HSC(
             args.latent_dim, 
             num_samp=args.num_samp, 
             hmc_e=args.hmc_e, 
             hmc_L=args.hmc_L,
             batch_size=batch_size,
-            train_size=train_size)
-        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr,
-            test_sample=test_sample, random_vector_for_generation=random_vector_for_generation, generation=True)
+            train_size=train_size)         
+        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr, stop_idx=train_size, warm_up=args.warm_up,
+            test_sample=test_sample, random_vector_for_generation=random_vector_for_generation, generation=True,
+            load_path=load_path, load_epoch=args.load_epoch)
 
 
 

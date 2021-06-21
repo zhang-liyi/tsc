@@ -128,6 +128,7 @@ class VAE(tf.keras.Model):
         if not os.path.exists(path): 
             os.makedirs(path)
             os.makedirs(path+'generated-images/')
+            os.makedirs(path+'hmc-points/')
             os.makedirs(path+'encoder/')
             os.makedirs(path+'decoder/')
             for i in range(self.num_flow):
@@ -156,7 +157,7 @@ class VAE_Flow(VAE):
                 ]
             )
             self.arnets.append(arnet)
-            self.flows.append(tfb.Invert(tfb.MaskedAutoregressiveFlow(arnet)))
+            self.flows.append(tfb.MaskedAutoregressiveFlow(arnet))
         self.f_tot = tfb.Chain(self.flows)
 
     def flow(self, x):
@@ -271,17 +272,15 @@ class VAE_HSC(VAE_Flow):
             adaptation_rate=0.1)
     
     def get_current_state(self, idx):
-        if not self.first_epoch:
+        if not self.in_first_epoch:
             if idx + self.batch_size >= self.train_size:
                 return self.f_tot.inverse(self.hmc_points[idx:, :])
             else:
                 return self.f_tot.inverse(self.hmc_points[idx:(idx+self.batch_size), :])
         else:
-            if idx + self.batch_size >= self.train_size:
-                return self.hmc_points[idx:, :]
-            else:
-                return self.hmc_points[idx:(idx+self.batch_size), :]
-        # if not self.first_epoch:
+            return self.q_base.sample(1)
+            
+        # if not self.in_first_epoch:
         #     return self.q_base.sample(1)
         # else:
         #     if idx == 0:
@@ -328,6 +327,22 @@ class VAE_HSC(VAE_Flow):
         self.modify_current_state(idx, zt)
             
         return -tf.reduce_mean(logpx_z + logqz_x)
+
+    def warm_up_compute_loss(self, x):
+        mean, logvar = self.encode(x)
+        z = self.reparameterize(mean, logvar)
+        zt = self.flow(z)
+        x_logit = self.decode(zt)
+        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(logits=x_logit, labels=x)
+        logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        logpz = log_normal_pdf(zt, 0., 0.)
+        q = tfd.TransformedDistribution(
+            distribution=tfd.MultivariateNormalDiag(
+                loc=mean, scale_diag=tf.exp(logvar/2)),
+            bijector=self.f_tot)
+        logqz_x = q.log_prob(zt)
+        
+        return -tf.reduce_mean(logpx_z + logpz - logqz_x)
     
     def train_step(self, x, optimizer, idx):
         with tf.GradientTape() as tape:
@@ -337,8 +352,18 @@ class VAE_HSC(VAE_Flow):
         
         return loss
 
-    def train(self, train_dataset, test_dataset, epochs=10, lr=1e-4, stop_idx=60000,
-        test_sample=None, random_vector_for_generation=None, generation=False):
+    def warm_up_train_step(self, x, optimizer):
+        #self.decoder.trainable = False
+        with tf.GradientTape() as tape:
+            loss = self.warm_up_compute_loss(x)
+        gradients = tape.gradient(loss, self.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        #self.decoder.trainable = True
+
+        return loss
+
+    def train(self, train_dataset, test_dataset, epochs=10, lr=1e-4, stop_idx=60000, warm_up=False, 
+        test_sample=None, random_vector_for_generation=None, generation=False, load_path=None, load_epoch=1):
         self.write_results_helper('results/vae_hsc/')
         rp = open(self.file_path + "run_parameters.txt", "w")
         rp.write('Latent dimension: ' + str(self.latent_dim) + '\n')
@@ -352,11 +377,36 @@ class VAE_HSC(VAE_Flow):
 
         # Training
         optimizer = tf.keras.optimizers.Adam(lr)
-        for epoch in range(1, epochs + 1):
+        start_epoch = 1
+        self.in_first_epoch = True
+
+        if load_path is not None:
+            start_epoch = load_epoch
+            self.in_first_epoch = False
+            self.encoder.load_weights(load_path + 'models/epoch_'+str(load_epoch-1)+'_encoder/encoder')
+            self.decoder.load_weights(load_path + 'models/epoch_'+str(load_epoch-1)+'_decoder/decoder')
+            for i in range(model_hsc.num_flow):
+                self.arnets[i].load_weights(load_path +'models/epoch_'+str(load_epoch-1)+'_arnet_'+str(i)+'/arnet'+str(i))
+            self.hmc_points = np.genfromtxt(load_path +'hmc-points/hmc_points_'+str(load_epoch-1)+'.csv')
+
+        if warm_up:
+            start_epoch = 11
+            for epoch in range(1, start_epoch):
+                print('-- Epoch (warm up) {} --'.format(epoch))
+                for train_x in train_dataset:
+                    loss = self.warm_up_train_step(train_x, optimizer)
+                    print('ELBO', round(-loss.numpy(), 3))
+                # Save generated images
+                if generation:
+                    util.generate_images_from_images(self, test_sample, flow=True,
+                        path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
+                    util.generate_images_from_random(self, random_vector_for_generation, 
+                        path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
+
+        for epoch in range(start_epoch, epochs + 1):
             print('-- Epoch {} --'.format(epoch))
             idx = 0
             self.adapted_step_sizes = []
-            self.first_epoch = (epoch==1)
             for train_x in train_dataset:
                 start_time = datetime.datetime.now()
                 if idx >= stop_idx:
@@ -370,6 +420,8 @@ class VAE_HSC(VAE_Flow):
                           'accept rate', round(self.is_accepted, 3),
                           'step size', np.round(np.squeeze(self.adapted_step_sizes[-1]), 3),
                           'time', end_time-start_time)
+            self.in_first_epoch = False
+
             # Save generated images
             if generation:
                 util.generate_images_from_images(self, test_sample, flow=True,
@@ -377,12 +429,22 @@ class VAE_HSC(VAE_Flow):
                 util.generate_images_from_random(self, random_vector_for_generation, 
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
             # Save model
-            if epoch % 5 == 0 or epoch == epochs:
-                self.encoder.save_weights(self.file_path + 'encoder/encoder')
-                self.decoder.save_weights(self.file_path + 'decoder/decoder')
+            if epoch % 1 == 0 or epoch == epochs:
+                os.makedirs(self.file_path+'models/epoch_' + str(epoch) + '_encoder/')
+                os.makedirs(self.file_path+'models/epoch_' + str(epoch) + '_decoder/')
+                self.encoder.save_weights(self.file_path+'models/epoch_' + str(epoch) + '_encoder/encoder')
+                self.decoder.save_weights(self.file_path+'models/epoch_' + str(epoch) + '_decoder/decoder')
                 for i in range(self.num_flow):
-                    self.arnets[i].save_weights(self.file_path +'arnet'+str(i)+'/arnet'+str(i))
+                    os.makedirs(self.file_path+'models/epoch_' + str(epoch) + '_arnet_' + str(i) +'/')
+                    self.arnets[i].save_weights(self.file_path+'models/epoch_' + str(epoch) + '_arnet_' + str(i) +'/arnet'+str(i))
                 np.savetxt(self.file_path + 'hmc_acceptance.csv', np.squeeze(self.is_accepted_list))
+            np.savetxt(self.file_path + 'hmc-points/hmc_points_' + str(epoch) + '.csv', np.squeeze(self.hmc_points))
+            # Plot HMC points
+            if self.latent_dim == 2 and generation:
+                if epoch == start_epoch:
+                    old_points = None
+                old_points = util.plot_hmc_points(self.hmc_points[[0,30000,59999],:], old_points,
+                    path=self.file_path + 'hmc-points/epoch-'+str(epoch)+'.png')
 
         return
 
