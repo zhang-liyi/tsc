@@ -16,32 +16,99 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 class VI_KLqp:
 
-    def __init__(self, v_fam='gaussian', num_dims=2, loc_init=[2.,5.], scale_init=[1.,1.]):
-        self.v_fam = v_fam
+    def __init__(self, dataset='funnel', v_fam='gaussian', num_dims=2, 
+                 num_samp=1, batch_size=5000, train_size=5000, 
+                 loc_init=[2.,5.], scale_init=[1.,1.]):
+        self.v_fam = v_fam.lower()
+        self.dataset = dataset.lower()
         self.num_dims = num_dims
-        self.target = util.Funnel(num_dims).get_funnel_dist()
+        self.num_samp = num_samp
+        self.batch_size = batch_size
+        self.train_size = train_size
+        if self.dataset == 'funnel':
+            self.num_dims = num_dims
+            self.loc_init = [2.,5.]
+            self.scale_init = [1.,1.]
+        elif self.dataset == 'survey':
+            self.num_dims = 123
+            self.loc_init = tf.zeros(self.num_dims)
+            self.scale_init = tf.ones(self.num_dims)/3
+        
+        self.likelihood = self.define_likelihood()
+        self.prior = self.define_prior()
+        self.define_var_dist()
+        
+        if self.dataset == 'funnel':
+            self.trainable_var = self.q.trainable_variables
+        elif self.dataset == 'survey':
+            self.trainable_var = []
+            self.trainable_var.extend(self.q.trainable_variables)
+            self.trainable_var.extend([self.gamma_0,
+                                       self.gamma, 
+                                       self.sigma])
+            
+    def define_var_dist(self):
         if self.v_fam == 'iaf' or self.v_fam == 'flow':
+            self.p_weight = 1
             self.base_distribution = tfd.Sample(
-                tfd.Normal(0., 1.), sample_shape=[num_dims])
+                tfd.Normal(0., 1.), sample_shape=[self.num_dims])
             self.made = tfb.AutoregressiveNetwork(
                 params=2,
-                hidden_units=[20, 20],
-                event_shape=(2,),
+                hidden_units=[self.num_dims*5, self.num_dims*5],
+                event_shape=(self.num_dims,),
                 activation='elu',
                 kernel_initializer=tfk.initializers.GlorotNormal())
             self.make_model()
-        else: # v_fam == 'gaussian'
-            self.var_loc = tf.Variable(
-                tf.zeros(num_dims) + loc_init, 
-                name='loc')
-            self.var_scale = tfp.util.TransformedVariable(
-                tf.zeros(num_dims) + scale_init, 
+        elif self.v_fam == 'gaussian':
+            self.p_weight = 1
+            self.phi_m = tf.Variable(
+                self.loc_init, 
+                name='phi_m')
+            self.phi_s = tfp.util.TransformedVariable(
+                self.scale_init, 
                 tfb.Softplus(),
-                name='scale')
+                name='phi_s')
             self.q = tfd.MultivariateNormalDiag(
-                loc=self.var_loc, 
-                scale_diag=self.var_scale)
+                loc=self.phi_m, 
+                scale_diag=self.phi_s)
 
+    def define_likelihood(self):
+        if self.dataset == 'funnel':
+            return util.Funnel().get_funnel_dist()
+        elif self.dataset == 'survey':
+            self.x = tf.zeros((self.batch_size, 128)) # A placeholder to become data
+            self.gamma_0 = tf.Variable(0., dtype=tf.float32, name='gamma_0')
+            self.gamma = tf.Variable(tf.zeros(5), name='gamma')
+            return self.survey_likelihood_lpdf
+
+    def define_prior(self):
+        if self.dataset == 'funnel':
+            return None
+        elif self.dataset == 'survey':
+            self.sigma = tf.Variable(
+                tf.ones(7), 
+                name='sigma')
+            return self.survey_prior_lpdf
+        
+    def survey_likelihood_lpdf(self, alpha):
+        splitted_x = tf.split(self.x, [123, 5], axis=1)
+        term1 = tf.matmul(splitted_x[0], tf.reshape(alpha, (123, 1)))
+        term2 = self.gamma_0
+        term3 = tf.matmul(splitted_x[1], tf.reshape(self.gamma, (5, 1)))
+        logits = tf.squeeze(term1 + term2 + term3) # has shape (batch_size,)
+        return -tf.reduce_sum(
+            tf.nn.sigmoid_cross_entropy_with_logits(logits=logits, labels=self.y))
+    
+    def survey_prior_lpdf(self, alpha):
+        splitted_alpha = tf.split(alpha, [50, 6, 4, 5, 8, 30, 20], axis=1)
+        prior_lpdf = 0
+        for i in range(7):
+            prior_lpdf += tf.reduce_sum(util.log_normal_pdf(
+                splitted_alpha[i],
+                0,
+                tf.math.softplus(tf.gather(self.sigma, i))))
+        return prior_lpdf
+    
     def make_model(self):
         x_in = tfkl.Input(shape=(self.num_dims,), dtype=tf.float32) # eps
         x_ = self.made(x_in)
@@ -52,129 +119,259 @@ class VI_KLqp:
             self.bij)
 
     def load_model(self, path):
-        if self.v_fam == 'iaf' or self.v_fam == 'flow':
-            self.model.load_weights(path)
-            self.bij = tfb.Invert(tfb.MaskedAutoregressiveFlow(self.model))
-            self.q = tfd.TransformedDistribution(
-                self.base_distribution, 
-                self.bij)
-        else:
-            print('This function is only valid with flow-based VI.')
-
-    def kl_loss(self, q):
-        # Define KL loss
-        theta = q.sample(1)
-        loss = tf.reduce_mean(q.log_prob(theta) - self.target.log_prob(theta))
+        self.model.load_weights(path)
+        self.bij = tfb.Invert(tfb.MaskedAutoregressiveFlow(self.model))
+        self.q = tfd.TransformedDistribution(
+            self.base_distribution, 
+            self.bij)
+    
+    def kl_loss(self):
+        z = self.q.sample(self.num_samp)
+        if self.dataset == 'funnel':
+            loss = tf.reduce_mean(self.q.log_prob(z) - 
+                self.likelihood.log_prob(z))
+        elif self.dataset == 'survey':
+            loss = tf.reduce_mean(self.q.log_prob(z) - 
+                self.likelihood(z) - self.prior(z))
         return loss
+    
+    def record_data(self, lst):
+        if self.dataset == 'funnel':
+            if self.v_fam == 'gaussian':
+                lst[0].append(self.phi_m.numpy())
+                lst[1].append(self.phi_s.numpy())
+        elif self.dataset == 'survey':
+            if self.v_fam == 'gaussian':
+                lst[0].append(self.phi_m.numpy())
+                lst[1].append(self.phi_s.numpy())
+                lst[2].append(self.gamma_0.numpy())
+                lst[3].append(self.gamma.numpy())
+                lst[4].append(self.sigma.numpy())
+            elif self.v_fam == 'iaf' or self.v_fam == 'flow':
+                lst[2].append(self.gamma_0.numpy())
+                lst[3].append(self.gamma.numpy())
+                lst[4].append(self.sigma.numpy())
+        return lst
+    
+    def train(self, epochs=int(1e5), lr=0.001, save=True, path=None):
 
-    def train(self, epochs=int(1e5), lr=0.1, save=True):
-
-        self.lambd = self.q.trainable_variables
         optimizer = tf.keras.optimizers.SGD(learning_rate=lr)
-        mu = []
-        sig = []
+        phi_m = []
+        phi_s = []
+        gamma_0 = []
+        gamma = []
+        sigma = []
+        params = [phi_m, phi_s, gamma_0, gamma, sigma]
+        params_savenames = ['phi_m.csv', 'phi_s.csv', 'gamma_0.csv', 'gamma.csv', 'sigma.csv']
         elbo = []
-
-        for epoch in range(epochs):
-            if epoch > 10000:
-                optimizer = tf.keras.optimizers.SGD(learning_rate=lr/100)
-            elif epoch > 200:
-                optimizer = tf.keras.optimizers.SGD(learning_rate=lr/10)
-
-            if not (self.v_fam == 'iaf' or self.v_fam == 'flow'):
-                mu.append(self.var_loc.numpy())
-                sig.append(self.var_scale.numpy())
-            
-            with tf.GradientTape() as tape:
-
-                loss_value = self.kl_loss(self.q)
-                elbo.append(-loss_value)
-                
-                grads = tape.gradient(loss_value, self.lambd)
-
-            optimizer.apply_gradients(zip(grads, self.lambd))
-            
-            if epoch % 1 == 0:
-                print('epoch', epoch, 'elbo', -loss_value.numpy())
-
         if save:
             tm = str(datetime.datetime.now())
             tm_str = tm[:10]+'-'+tm[11:13]+tm[14:16]+tm[17:19]
-            path = 'results/' + 'vi_klqp_' + self.v_fam + '/' + tm_str + '/'
+            if path is None:
+                path = 'results/' + self.dataset + '/' + 'vi_klqp_' + self.v_fam + '/' + tm_str + '/'
+            else:
+                path += self.dataset + '/' + 'vi_klqp_' + self.v_fam + '/' + tm_str + '/'
             if not os.path.exists(path): 
                 os.makedirs(path)
 
-            elbo = np.array(elbo)
-            np.savetxt(path+'elbo.csv', elbo)
-            if self.v_fam == 'iaf' or self.v_fam == 'flow':
-                self.model.save_weights(path + 'checkpoints/iaf_qp')
-            else:
-                mu = np.array(mu)
-                sig = np.array(sig)
-                np.savetxt(path+'mu.csv', mu)
-                np.savetxt(path+'sig.csv', sig)
+        for epoch in range(1, epochs + 1):
             
-            rp = open(path + "run_parameters.txt", "w")
-            rp.write('epochs ' + str(epochs) + '\n')
-            rp.write('initial learning rate ' + str(lr) + '\n')
-            rp.close()
+            params = self.record_data(params)
+
+            with tf.GradientTape() as tape:
+                loss_value = self.kl_loss()
+                elbo.append(-loss_value.numpy())
+                
+                grads = tape.gradient(loss_value, self.trainable_var)
+
+            optimizer.apply_gradients(zip(grads, self.trainable_var))
+            
+            if epoch % 50 == 0 or epoch == 1:
+                if self.dataset == 'funnel':
+                    if self.v_fam == 'iaf' or self.v_fam == 'flow':
+                        print('Epoch', epoch, 
+                              'Loss', loss_value.numpy())
+                    elif self.v_fam == 'gaussian':
+                        print('Epoch', epoch, 
+                              'Loss', np.round(loss_value.numpy(),3),
+                              'phi_s', np.round(self.phi_s.numpy(),3))
+                elif self.dataset == 'survey':
+                    if self.v_fam == 'iaf' or self.v_fam == 'flow':
+                        print('Epoch', epoch, 
+                              'Loss', loss_value.numpy(),  
+                              'gamma', np.round(self.gamma.numpy(),3),)
+                    elif self.v_fam == 'gaussian':
+                        print('Epoch', epoch, 
+                              'Loss', np.round(loss_value.numpy(),3),
+                              'gamma', np.round(self.gamma.numpy(),3),
+                              'phi_s', np.round(np.mean(self.phi_s.numpy()),3))
+            if (epoch % 1000 == 0 or epoch == 1) and save:
+                np.savetxt(path+'elbo.csv', np.array(elbo))
+                if self.v_fam == 'iaf' or self.v_fam == 'flow':
+                    self.model.save_weights(path + 'flow_model/model')
+                for i in range(len(params)):
+                    if len(params[i]) != 0:
+                        np.savetxt(path + params_savenames[i], np.array(params[i]))
+                if epoch == 1:
+                    rp = open(path + "run_parameters.txt", "w")
+                    rp.write('dataset: ' + str(self.dataset) + '\n')
+                    rp.write('variational family: ' + self.v_fam + '\n')
+                    rp.write('number of samples: ' + str(self.num_samp) + '\n')
+                    rp.write('epochs: ' + str(epochs) + '\n')
+                    rp.write('learning rate: ' + str(lr) + '\n')
+                    rp.close()
 
 
 
 class VI_KLpq:
 
-    def __init__(self, v_fam='gaussian', space='eps', num_dims=2, loc_init=[2.,5.], scale_init=[1.,1.], 
-        hmc_e=0.25, hmc_L=4, pt_init=tf.constant([[2,10]], dtype=tf.float32)):
-        self.space = space
-        self.v_fam = v_fam
-        self.num_dims = num_dims
-        self.target = util.Funnel(num_dims).get_funnel_dist()
+    def __init__(self, dataset='funnel', v_fam='gaussian', space='eps', num_dims=2, 
+                 num_samp=1, chains=1, hmc_e=0.25, hmc_L=4, 
+                 batch_size=5000, train_size=5000, 
+                 pt_init=tf.constant([[2,10]], dtype=tf.float32), 
+                 loc_init=[2.,5.], scale_init=[1.,1.]):
+        self.space = space.lower()
+        self.v_fam = v_fam.lower()
+        self.dataset = dataset.lower()
+        if self.dataset == 'funnel':
+            self.num_dims = num_dims
+            self.pt_init = tf.tile(pt_init, [chains, 1])
+            self.loc_init = loc_init
+            self.scale_init = scale_init
+        elif self.dataset == 'survey':
+            self.num_dims = 123
+            self.pt_init = tfd.Sample(tfd.Normal(0,1), self.num_dims).sample(chains)
+            self.loc_init = tf.zeros(self.num_dims)
+            self.scale_init = tf.ones(self.num_dims)/3
         self.hmc_e = hmc_e
         self.hmc_L = hmc_L
-        self.pt_init = pt_init
-
+        self.batch_size = batch_size
+        self.train_size = train_size
+        self.chains = chains
+        self.num_samp = num_samp
+        
+        self.likelihood = self.define_likelihood()
+        self.prior = self.define_prior()
+        self.define_var_dist()
+        self.log_hmc_target = self.define_log_hmc_target()
+        self.hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
+            target_log_prob_fn=self.log_hmc_target,
+            step_size=np.float32(self.hmc_e),
+            num_leapfrog_steps=self.hmc_L,
+            state_gradients_are_stopped=True)
+        
+        if self.dataset == 'funnel':
+            self.trainable_var = self.q.trainable_variables
+        elif self.dataset == 'survey':
+            self.trainable_var = []
+            self.trainable_var.extend(self.q.trainable_variables)
+            self.trainable_var.extend([self.gamma_0,
+                                       self.gamma, 
+                                       self.sigma])
+        
+    def define_var_dist(self):
         if self.v_fam == 'iaf' or self.v_fam == 'flow':
-            self.space = 'eps' # it would be meaningless to input v_fam as flow but space as theta
+            self.p_weight = 1
             self.base_distribution = tfd.Sample(
-                tfd.Normal(0., 1.), sample_shape=[num_dims])
+                tfd.Normal(0., 1.), sample_shape=[self.num_dims])
             self.made = tfb.AutoregressiveNetwork(
                 params=2,
-                hidden_units=[20, 20],
-                event_shape=(2,),
+                hidden_units=[self.num_dims*5, self.num_dims*5],
+                event_shape=(self.num_dims,),
                 activation='elu',
                 kernel_initializer=tfk.initializers.GlorotNormal())
             self.make_model()
-            self.hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
-                    target_log_prob_fn=self.log_hmc_target,
-                    step_size=np.float32(self.hmc_e),
-                    num_leapfrog_steps=self.hmc_L)
-        else: # self.v_fam == 'gaussian'
-            self.var_loc = tf.Variable(
-                tf.zeros(num_dims) + loc_init, 
-                name='loc')
-            self.var_scale = tfp.util.TransformedVariable(
-                tf.zeros(num_dims) + scale_init, 
+        elif self.v_fam == 'gaussian':
+            self.p_weight = 1
+            self.phi_m = tf.Variable(
+                self.loc_init, 
+                name='phi_m')
+            self.phi_s = tfp.util.TransformedVariable(
+                self.scale_init, 
                 tfb.Softplus(),
-                name='scale')
+                name='phi_s')
             self.q = tfd.MultivariateNormalDiag(
-                loc=self.var_loc, 
-                scale_diag=self.var_scale)
-            if self.space == 'eps':
+                loc=self.phi_m, 
+                scale_diag=self.phi_s)
+            if self.space == 'eps' or self.space == 'warped':
                 self.bij = tfb.Affine(
-                    shift=self.var_loc,
-                    scale_diag=self.var_scale)
-                self.hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
-                    target_log_prob_fn=self.log_hmc_target,
-                    step_size=np.float32(self.hmc_e),
-                    num_leapfrog_steps=self.hmc_L)
-                self.current_state = self.bij.inverse(pt_init)
-            else: # self.space == 'theta'
-                self.hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
-                    target_log_prob_fn=self.target.log_prob,
-                    step_size=np.float32(self.hmc_e),
-                    num_leapfrog_steps=self.hmc_L)
-                self.current_state = pt_init
+                    shift=self.phi_m,
+                    scale_diag=self.phi_s)
 
+    def define_likelihood(self):
+        if self.dataset == 'funnel':
+            return util.Funnel().get_funnel_dist().log_prob
+        elif self.dataset == 'survey':
+            self.x = tf.zeros((self.batch_size, 128)) # A placeholder to become data
+            self.gamma_0 = tf.Variable(0., dtype=tf.float32, name='gamma_0')
+            self.gamma = tf.Variable(tf.zeros(5), name='gamma')
+            return self.survey_likelihood_lpdf
+
+    def define_prior(self):
+        if self.dataset == 'funnel':
+            return None
+        elif self.dataset == 'survey':
+            self.sigma = tf.Variable(
+                tf.ones(7), 
+                name='sigma')
+            return self.survey_prior_lpdf
+        
+    def define_log_hmc_target(self):
+        if self.space == 'eps' or self.space == 'warped':
+            self.current_state = self.bij.inverse(self.pt_init)
+            return self.log_hmc_target_warped_space
+        else:
+            self.current_state = self.pt_init
+            return self.log_hmc_target
+        
+    def survey_likelihood_lpdf(self, alpha):
+        splitted_x = tf.split(self.x, [123, 5], axis=1)
+        term1 = tf.matmul(splitted_x[0], tf.reshape(alpha, (123, 1)))
+        term2 = self.gamma_0
+        term3 = tf.matmul(splitted_x[1], tf.reshape(self.gamma, (5, 1)))
+        logits = tf.squeeze(term1 + term2 + term3) # has shape (batch_size,)
+        return -tf.reduce_sum(
+            tf.nn.sigmoid_cross_entropy_with_logits(logits=logits, labels=self.y))
+    
+    def survey_prior_lpdf(self, alpha):
+        # alpha must be 1-by-123
+        splitted_alpha = tf.split(alpha, [50, 6, 4, 5, 8, 30, 20], axis=1)
+        prior_lpdf = 0
+        for i in range(7):
+            prior_lpdf += tf.reduce_sum(util.log_normal_pdf(
+                splitted_alpha[i],
+                0,
+                tf.math.softplus(tf.gather(self.sigma, i))))
+        return prior_lpdf 
+    
+    def log_hmc_target_warped_space(self, eps):
+        # Unnormalized density p(epsilon | data)
+        if self.dataset == 'funnel':
+            z = self.bij.forward(eps)
+            part1 = self.likelihood(z)
+            part2 = self.bij.forward_log_det_jacobian(eps, 1)
+            return part1 + part2
+        elif self.dataset == 'survey':
+            z = self.bij.forward(eps)
+            part1 = self.likelihood(z) + self.prior(z)
+            part2 = self.bij.forward_log_det_jacobian(eps, 1)
+            return part1 + part2
+    
+    def log_hmc_target(self, z):
+        # Unnormalized density p(z | data)
+        if self.dataset == 'funnel':
+            return self.likelihood(z)
+        elif self.dataset == 'survey':
+            return self.likelihood(z) + self.prior(z)
+    
+    def loss(self, z): 
+        if self.dataset == 'funnel':
+            return -tf.reduce_mean(self.q.log_prob(z)) # Just KL(pq)
+        elif self.dataset == 'survey':
+            return -tf.reduce_mean(self.q.log_prob(z) + \
+                                   self.p_weight*self.likelihood(tf.squeeze(z, axis=0)) + \
+                                   self.p_weight*self.prior(tf.squeeze(z, axis=0)))
+    
     def make_model(self):
         x_in = tfkl.Input(shape=(self.num_dims,), dtype=tf.float32) # eps
         x_ = self.made(x_in)
@@ -183,126 +380,138 @@ class VI_KLpq:
         self.q = tfd.TransformedDistribution(
             self.base_distribution, 
             self.bij)
-        self.current_state = self.bij.inverse(self.pt_init)
 
     def load_model(self, path):
-        if self.v_fam == 'iaf' or self.v_fam == 'flow':
-            self.model.load_weights(path)
-            self.bij = tfb.Invert(tfb.MaskedAutoregressiveFlow(self.model))
-            self.q = tfd.TransformedDistribution(
-                self.base_distribution, 
-                self.bij)
-            self.current_state = self.bij.inverse(self.pt_init)
-        else:
-            print('This function is only valid with flow-based VI.')
+        self.model.load_weights(path)
+        self.bij = tfb.Invert(tfb.MaskedAutoregressiveFlow(self.model))
+        self.q = tfd.TransformedDistribution(
+            self.base_distribution, 
+            self.bij)
+        
+    def record_data(self, lst):
+        if self.dataset == 'funnel':
+            if self.v_fam == 'gaussian':
+                lst[0].append(self.phi_m.numpy())
+                lst[1].append(self.phi_s.numpy())
+        elif self.dataset == 'survey':
+            if self.v_fam == 'gaussian':
+                lst[0].append(self.phi_m.numpy())
+                lst[1].append(self.phi_s.numpy())
+                lst[2].append(self.gamma_0.numpy())
+                lst[3].append(self.gamma.numpy())
+                lst[4].append(self.sigma.numpy())
+            elif self.v_fam == 'iaf' or self.v_fam == 'flow':
+                lst[2].append(self.gamma_0.numpy())
+                lst[3].append(self.gamma.numpy())
+                lst[4].append(self.sigma.numpy())
+        return lst
 
-    def log_hmc_target(self, eps):
-        # Unnormalized density of p(epsilon | data)
-        theta = self.bij.forward(eps)
-        part1 = self.target.log_prob(theta)
-        part2 = self.bij.forward_log_det_jacobian(eps, 2)
-    
-        return part1 + part2
-    
-    def kl_pq_loss(self, theta, q): 
-        return -tf.reduce_mean(q.log_prob(theta))
+    def train(self, epochs=int(1e5), lr=0.001, save=True, path=None):
 
-    def train(self, epochs=int(1e5), lr=0.1, num_samp=1, save=True):
-
-        self.lambd = self.q.trainable_variables
         optimizer = tf.keras.optimizers.SGD(learning_rate=lr)
+        phi_m = []
+        phi_s = []
+        gamma_0 = []
+        gamma = []
+        sigma = []
+        params = [phi_m, phi_s, gamma_0, gamma, sigma]
+        params_savenames = ['phi_m.csv', 'phi_s.csv', 'gamma_0.csv', 'gamma.csv', 'sigma.csv']
         losses = []
         hmc_points = []
-        mu = []
-        sig = []
         is_accepted = 0
-
-        for epoch in range(epochs):
-            if epoch > 10000:
-                optimizer = tf.keras.optimizers.SGD(learning_rate=lr/100)
-            elif epoch > 200:
-                optimizer = tf.keras.optimizers.SGD(learning_rate=lr/10)
-            
-            out = tfp.mcmc.sample_chain(num_samp, self.current_state, 
-                previous_kernel_results=None, kernel=self.hmc_kernel,
-                num_burnin_steps=0, num_steps_between_results=0, 
-                trace_fn=(lambda current_state, kernel_results: kernel_results), 
-                return_final_kernel_results=False, seed=None, name=None)
-            kernel_results = out[1]
-            
-            if self.space == 'eps':
-                eps = out[0]
-                theta = self.bij.forward(eps)
-            else:
-                theta = out[0]
-            
-            hmc_points.append(theta.numpy())
-            is_accepted += np.mean(np.squeeze(kernel_results.is_accepted.numpy()))
-            if not (self.v_fam == 'iaf' or self.v_fam == 'flow'):
-                mu.append(self.var_loc.numpy())
-                sig.append(self.var_scale.numpy())
-            
-            theta = tf.stop_gradient(theta)
-            
-            with tf.GradientTape() as tape:
-                
-                loss_value = self.kl_pq_loss(theta, self.q)
-                losses.append(loss_value)
-                
-                grads = tape.gradient(loss_value, self.lambd)
-
-            optimizer.apply_gradients(zip(grads, self.lambd))
-            
-            if self.space == 'eps':
-                if not (self.v_fam == 'iaf' or self.v_fam == 'flow'):
-                    self.bij = tfb.Affine(
-                        shift=self.var_loc,
-                        scale_diag=self.var_scale)
-                self.current_state = self.bij.inverse(tf.gather(theta, num_samp-1))
-            else:
-                self.current_state = tf.gather(theta, num_samp-1)
-            
-            if self.v_fam == 'iaf' or self.v_fam == 'flow':
-                print('Epoch', epoch, 
-                      'Loss', loss_value.numpy(),  
-                      'eps', self.current_state.numpy(),
-                      'point', tf.gather(theta, num_samp-1).numpy(),
-                      'acceptance rate', round(is_accepted/(epoch+1),3))
-            else:
-                print('Epoch', epoch, 
-                      'Loss', np.round(loss_value.numpy(),3),  
-                      'point', np.round(tf.gather(theta, num_samp-1).numpy(),3),
-                      'mu_param', np.round(self.var_loc.numpy(),3),
-                      'sig_param', np.round(self.var_scale.numpy(),3),
-                      'acceptance rate', round(is_accepted/(epoch+1),3))
-
         if save:
             tm = str(datetime.datetime.now())
             tm_str = tm[:10]+'-'+tm[11:13]+tm[14:16]+tm[17:19]
-            path = 'results/' + 'vi_klpq_' + self.v_fam + '_' + self.space + '/' + tm_str + '/'
+            if path is None:
+                path = 'results/' + self.dataset + '/' + 'vi_klpq_' + self.v_fam + '/' + tm_str + '/'
+            else:
+                path += self.dataset + '/' + 'vi_klpq_' + self.v_fam + '/' + tm_str + '/'
             if not os.path.exists(path): 
                 os.makedirs(path)
 
-            hmc_points = np.squeeze(np.array(hmc_points))
-            losses = np.array(losses)
-            np.savetxt(path+'hmc_points.csv', hmc_points)
-            np.savetxt(path+'losses.csv', losses)
-            if self.v_fam == 'iaf' or self.v_fam == 'flow':
-                self.model.save_weights(path + 'checkpoints/iaf_pq')
+        for epoch in range(1, epochs+1):
+            
+            out = tfp.mcmc.sample_chain(self.num_samp, self.current_state, 
+                previous_kernel_results=None, kernel=self.hmc_kernel,
+                num_burnin_steps=0, num_steps_between_results=0, 
+                trace_fn=(lambda current_state, kernel_results: kernel_results.is_accepted), 
+                return_final_kernel_results=False, seed=None, name=None)
+            results_is_accepted = out[1]
+            if self.space == 'eps' or self.space == 'warped':
+                eps = tf.gather(out[0], self.num_samp-1)
+                z = self.bij.forward(eps)
             else:
-                mu = np.array(mu)
-                sig = np.array(sig)
-                np.savetxt(path+'mu.csv', mu)
-                np.savetxt(path+'sig.csv', sig)
+                z = tf.gather(out[0], self.num_samp-1)
+            z = tf.stop_gradient(z)
+            
+            params = self.record_data(params)
+            hmc_points.append(z.numpy())
+            is_accepted += np.mean(np.squeeze(results_is_accepted.numpy()))
+            
+            with tf.GradientTape() as tape:
+                
+                loss_value = self.loss(z)
+                losses.append(loss_value.numpy())
+                
+                grads = tape.gradient(loss_value, self.trainable_var)
 
-            rp = open(path + "run_parameters.txt", "w")
-            rp.write('epochs: ' + str(epochs) + '\n')
-            rp.write('initial learning rate: ' + str(lr) + '\n')
-            rp.write('number of samples during VI training: ' + str(num_samp) + '\n')
-            rp.write('HMC step size e: ' + str(self.hmc_e) + '\n')
-            rp.write('HMC number of leapfrog steps L: ' + str(self.hmc_L) + '\n')
-            rp.write('acceptance rate: ' +str( round(is_accepted/(epochs+1),3) ) + '\n')
-            rp.close()
+            optimizer.apply_gradients(zip(grads, self.trainable_var))
+            
+            if self.space == 'eps' or self.space == 'warped':
+                if not (self.v_fam == 'iaf' or self.v_fam == 'flow'):
+                    self.bij = tfb.Affine(
+                        shift=self.phi_m,
+                        scale_diag=self.phi_s)
+                self.current_state = self.bij.inverse(z)
+            else:
+                self.current_state = z
+                
+            if epoch % 1 == 0:
+                if self.dataset == 'funnel':
+                    if self.v_fam == 'iaf' or self.v_fam == 'flow':
+                        print('Epoch', epoch, 
+                              'Loss', loss_value.numpy(), 
+                              'eps', np.round(tf.gather(eps, 0).numpy(),3),
+                              'point', np.round(tf.gather(z, 0).numpy(),3), 
+                              'acceptance rate', round(is_accepted/(epoch+1),3))
+                    elif self.v_fam == 'gaussian':
+                        print('Epoch', epoch, 
+                              'Loss', np.round(loss_value.numpy(),3),
+                              'point', np.round(tf.gather(z, 0).numpy(),3), 
+                              'phi_s', np.round(self.phi_s.numpy(),3),
+                              'acceptance rate', round(is_accepted/(epoch+1),3))
+                elif self.dataset == 'survey':
+                    if self.v_fam == 'iaf' or self.v_fam == 'flow':
+                        print('Epoch', epoch, 
+                              'Loss', loss_value.numpy(),  
+                              'acceptance rate', round(is_accepted/(epoch+1),3),
+                              'gamma', np.round(self.gamma.numpy(),3),)
+                    elif self.v_fam == 'gaussian':
+                        print('Epoch', epoch, 
+                              'Loss', np.round(loss_value.numpy(),3),
+                              'acceptance rate', round(is_accepted/(epoch+1),3),
+                              'gamma', np.round(self.gamma.numpy(),3),
+                              'phi_s', np.round(np.mean(self.phi_s.numpy()),3))
+            if (epoch % 1000 == 0 or epoch == 1) and save:
+                np.savetxt(path+'losses.csv', np.array(losses))
+                np.savetxt(path+'hmc_points.csv', np.reshape(np.squeeze(np.array(hmc_points)), (-1, self.num_dims)))
+                if self.v_fam == 'iaf' or self.v_fam == 'flow':
+                    self.model.save_weights(path + 'flow_model/model')
+                for i in range(len(params)):
+                    if len(params[i]) != 0:
+                        np.savetxt(path + params_savenames[i], np.array(params[i]))
+                if epoch == 1:
+                    rp = open(path + "run_parameters.txt", "w")
+                    rp.write('dataset: ' + str(self.dataset) + '\n')
+                    rp.write('variational family: ' + self.v_fam + '\n')
+                    rp.write('epochs: ' + str(epochs) + '\n')
+                    rp.write('learning rate: ' + str(lr) + '\n')
+                    rp.write('HMC space: ' + self.space + '\n')
+                    rp.write('HMC step size e: ' + str(self.hmc_e) + '\n')
+                    rp.write('HMC number of leapfrog steps L: ' + str(self.hmc_L) + '\n')
+                    rp.write('HMC number of chains: ' + str(self.chains) + '\n')
+                    rp.write('acceptance rate: ' +str( round(is_accepted/(epochs),3) ) + '\n')
+                    rp.close()
 
 
 
@@ -355,32 +564,37 @@ class HMC:
 
         return part1 + part2
 
-    def run(self, path=None, save=True):
+    def run(self, load_path=None, save=True, path=None):
         if self.space == 'eps':
-            if path is not None:
+            if load_path is not None:
                 self.load_model(path)
             self.hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
                 target_log_prob_fn=self.log_hmc_target,
                 step_size=np.float32(self.hmc_e),
-                num_leapfrog_steps=self.hmc_L)
+                num_leapfrog_steps=self.hmc_L,
+                state_gradients_are_stopped=True)
         else:
             self.hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
                 target_log_prob_fn=self.target.log_prob,
                 step_size=np.float32(self.hmc_e),
-                num_leapfrog_steps=self.hmc_L)
+                num_leapfrog_steps=self.hmc_L,
+                state_gradients_are_stopped=True)
 
         out = tfp.mcmc.sample_chain(
             self.iters, self.current_state, previous_kernel_results=None, kernel=self.hmc_kernel,
             num_burnin_steps=0, num_steps_between_results=0, parallel_iterations=self.chains, 
-            trace_fn=(lambda current_state, kernel_results: kernel_results), 
+            trace_fn=(lambda current_state, kernel_results: kernel_results.is_accepted), 
             return_final_kernel_results=False, seed=None, name=None)
         
-        accept_rate = np.sum(np.squeeze(out[1].is_accepted.numpy()))/self.iters/self.chains
+        accept_rate = np.sum(np.squeeze(out[1].numpy()))/self.iters/self.chains
 
         if save:
             tm = str(datetime.datetime.now())
             tm_str = tm[:10]+'-'+tm[11:13]+tm[14:16]+tm[17:19]
-            path = 'results/' + 'hmc_' + self.space + '/' + tm_str + '/'
+            if path is None:
+                path = 'results/' + 'hmc_' + self.space + '/' + tm_str + '/'
+            else:
+                path += 'hmc_' + self.space + '/' + tm_str + '/'
             if not os.path.exists(path): 
                 os.makedirs(path)
 

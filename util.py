@@ -42,17 +42,22 @@ def load_mnist(batch_size=32):
     test_size = 10000
 
     train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
-                     .shuffle(train_size, reshuffle_each_iteration=False).batch(batch_size))
+                     .shuffle(train_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
     test_dataset = (tf.data.Dataset.from_tensor_slices(test_images)
-                    .shuffle(test_size, reshuffle_each_iteration=False).batch(batch_size))
+                    .shuffle(test_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
 
     return train_dataset, test_dataset
 
-def generate_images_from_images(model, test_sample, flow=False, path=None):
+def log_normal_pdf(sample, mean, logvar, raxis=1):
+    log2pi = tf.math.log(2. * np.pi)
+    return tf.reduce_sum(
+        -.5 * ((sample - mean) ** 2. * tf.exp(-logvar) + logvar + log2pi),
+        axis=raxis)
+
+def generate_images_from_images(model, test_sample, path=None):
     mean, logvar = model.encode(test_sample)
     z = model.reparameterize(mean, logvar)
-    if flow:
-        z = model.flow(z)
+    z = model.f_tot.forward(z)
     predictions = model.sample(z)
     fig = plt.figure(figsize=(4, 4))
     for i in range(predictions.shape[0]):
@@ -60,7 +65,6 @@ def generate_images_from_images(model, test_sample, flow=False, path=None):
         plt.imshow(predictions[i, :, :, 0], cmap='gray')
         plt.axis('off')
 
-    # tight_layout minimizes the overlap between 2 sub-plots
     if path is not None:
         plt.savefig(path)
         plt.close()
@@ -73,7 +77,6 @@ def generate_images_from_random(model, rand_vec, path=None):
         plt.imshow(predictions[i, :, :, 0], cmap='gray')
         plt.axis('off')
 
-    # tight_layout minimizes the overlap between 2 sub-plots
     if path is not None:
         plt.savefig(path)
         plt.close()
@@ -81,8 +84,8 @@ def generate_images_from_random(model, rand_vec, path=None):
 def plot_hmc_points(points, old_points=None, path=None):
     if old_points is None:
         plt.plot(points[0,0],points[0,1], 'o', label='pt 1')
-        plt.plot(points[1,0],points[1,1], 'o', label='pt 30001')
-        plt.plot(points[2,0],points[2,1], 'o', label='pt 60000')
+        plt.plot(points[1,0],points[1,1], 'o', label='pt 2')
+        plt.plot(points[2,0],points[2,1], 'o', label='pt 3')
         plt.legend()
         plt.savefig(path)
         plt.close()
@@ -90,8 +93,8 @@ def plot_hmc_points(points, old_points=None, path=None):
     else:
         points = np.concatenate((old_points, np.expand_dims(points, 0)))
         plt.plot(points[:,0,0], points[:,0,1], label='pt 1')
-        plt.plot(points[:,1,0], points[:,1,1], label='pt 30001')
-        plt.plot(points[:,2,0], points[:,2,1], label='pt 60000')
+        plt.plot(points[:,1,0], points[:,1,1], label='pt 2')
+        plt.plot(points[:,2,0], points[:,2,1], label='pt 3')
         plt.legend()
         plt.savefig(path)
         plt.close()

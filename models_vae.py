@@ -12,19 +12,15 @@ import util
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
-def log_normal_pdf(sample, mean, logvar, raxis=1):
-    log2pi = tf.math.log(2. * np.pi)
-    return tf.reduce_sum(
-        -.5 * ((sample - mean) ** 2. * tf.exp(-logvar) + logvar + log2pi),
-        axis=raxis)
 
 
 class VAE(tf.keras.Model):
-    """variational autoencoder."""
+    """variational autoencoder, with the option of adding flow."""
 
-    def __init__(self, latent_dim, batch_size=32):
+    def __init__(self, latent_dim, num_flow=0, batch_size=32):
         super().__init__()
         self.latent_dim = latent_dim
+        self.num_flow = num_flow
         self.batch_size = batch_size
         self.encoder = tf.keras.Sequential(
             [
@@ -52,6 +48,29 @@ class VAE(tf.keras.Model):
                     filters=1, kernel_size=3, strides=1, padding='same'),
             ]
         )
+        self.build_flow()
+    
+    def build_flow(self):
+        self.arnets = []
+        self.flows = []
+        if self.num_flow > 0:
+            for _ in range(self.num_flow):
+                arnet = tf.keras.Sequential(
+                    [
+                        tf.keras.layers.InputLayer(input_shape=(latent_dim,)),
+                        tfb.AutoregressiveNetwork(
+                            params=2,
+                            hidden_units=[latent_dim*5,latent_dim*5],
+                            event_shape=self.latent_dim,
+                            activation='elu',
+                            kernel_initializer=tfk.initializers.GlorotNormal()),
+                    ]
+                )
+                self.arnets.append(arnet)
+                self.flows.append(tfb.Invert(tfb.MaskedAutoregressiveFlow(arnet)))
+            self.f_tot = tfb.Chain(self.flows)
+        else:
+            self.f_tot = tfb.Identity()
 
     def sample(self, eps=None):
         if eps is None:
@@ -76,11 +95,13 @@ class VAE(tf.keras.Model):
     def compute_loss(self, x):
         mean, logvar = self.encode(x)
         z = self.reparameterize(mean, logvar)
+        z = self.f_tot.forward(z)
         x_logit = self.decode(z)
         cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(logits=x_logit, labels=x)
         logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
-        logpz = log_normal_pdf(z, 0., 0.)
-        logqz_x = log_normal_pdf(z, mean, logvar)
+        logpz = util.log_normal_pdf(z, 0., 0.)
+        logqz_x = util.log_normal_pdf(z, mean, logvar) - self.f_tot.forward_log_det_jacobian(z, 1)
+        
         return -tf.reduce_mean(logpx_z + logpz - logqz_x)
 
     def train_step(self, x, optimizer):
@@ -92,14 +113,15 @@ class VAE(tf.keras.Model):
 
     def train(self, train_dataset, test_dataset, epochs=10, lr=1e-4,
         test_sample=None, random_vector_for_generation=None, generation=False):
-        self.write_results_helper('results/vae/')
+        self.write_results_helper('results/vae_flow/')
         rp = open(self.file_path + "run_parameters.txt", "w")
         rp.write('Latent dimension: ' + str(self.latent_dim) + '\n')
+        rp.write('Number of flows: ' + str(self.num_flow) + '\n')
         rp.write('Number of epochs: ' + str(epochs) + '\n')
         rp.write('Learning rate: ' + str(lr) + '\n')
         rp.write('Batch size: ' + str(self.batch_size) + '\n')
         rp.close()
-
+        
         optimizer = tf.keras.optimizers.Adam(lr)
         for epoch in range(1, epochs + 1):
 
@@ -115,9 +137,18 @@ class VAE(tf.keras.Model):
             print('Epoch: {}, Test set ELBO: {}, time elapse for current epoch: {}'
                 .format(epoch, elbo, end_time - start_time))
 
+            # Save generated images
             if generation:
-                util.generate_images_from_images(self, test_sample)
-                util.generate_images_from_random(self, random_vector_for_generation)
+                util.generate_images_from_images(self, test_sample,
+                    path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
+                util.generate_images_from_random(self, random_vector_for_generation, 
+                    path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
+            # Save model
+            if epoch % 5 == 0 or epoch == epochs:
+                self.encoder.save_weights(self.file_path + 'encoder/encoder')
+                self.decoder.save_weights(self.file_path + 'decoder/decoder')
+                for i in range(self.num_flow):
+                    self.arnets[i].save_weights(self.file_path +'arnet'+str(i)+'/arnet'+str(i))
             
     def write_results_helper(self, folder):
         # Save directory
@@ -136,90 +167,8 @@ class VAE(tf.keras.Model):
 
 
 
-class VAE_Flow(VAE):
-    """variational autoencoder with a flow-based posterior."""
-
-    def __init__(self, latent_dim, num_flow=5, batch_size=32):
-        super().__init__(latent_dim, batch_size=batch_size)
-        self.num_flow = num_flow
-        self.arnets = []
-        self.flows = []
-        for _ in range(num_flow):
-            arnet = tf.keras.Sequential(
-                [
-                    tf.keras.layers.InputLayer(input_shape=(latent_dim,)),
-                    tfb.AutoregressiveNetwork(
-                        params=2,
-                        hidden_units=[latent_dim*5,latent_dim*5],
-                        event_shape=self.latent_dim,
-                        activation='elu',
-                        kernel_initializer=tfk.initializers.GlorotNormal()),
-                ]
-            )
-            self.arnets.append(arnet)
-            self.flows.append(tfb.MaskedAutoregressiveFlow(arnet))
-        self.f_tot = tfb.Chain(self.flows)
-
-    def flow(self, x):
-        return self.f_tot.forward(x)
-    
-    def compute_loss(self, x):
-        mean, logvar = self.encode(x)
-        z = self.reparameterize(mean, logvar)
-        zt = self.flow(z)
-        x_logit = self.decode(zt)
-        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(logits=x_logit, labels=x)
-        logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
-        logpz = log_normal_pdf(zt, 0., 0.)
-        q = tfd.TransformedDistribution(
-            distribution=tfd.MultivariateNormalDiag(
-                loc=mean, scale_diag=tf.exp(logvar/2)),
-            bijector=self.f_tot)
-        logqz_x = q.log_prob(zt)
-        
-        return -tf.reduce_mean(logpx_z + logpz - logqz_x)
-
-    def train(self, train_dataset, test_dataset, epochs=10, lr=1e-4,
-        test_sample=None, random_vector_for_generation=None, generation=False):
-        self.write_results_helper('results/vae_flow/')
-        rp = open(self.file_path + "run_parameters.txt", "w")
-        rp.write('Latent dimension: ' + str(self.latent_dim) + '\n')
-        rp.write('Number of epochs: ' + str(epochs) + '\n')
-        rp.write('Learning rate: ' + str(lr) + '\n')
-        rp.write('Batch size: ' + str(self.batch_size) + '\n')
-        rp.close()
-        
-        optimizer = tf.keras.optimizers.Adam(lr)
-        for epoch in range(1, epochs + 1):
-            start_time = datetime.datetime.now()
-            for train_x in train_dataset:
-                elbo = -self.train_step(train_x, optimizer)
-            end_time = datetime.datetime.now()
-
-            loss = tf.keras.metrics.Mean()
-            for test_x in test_dataset:
-                loss(self.compute_loss(test_x))
-            elbo = -loss.result()
-            print('Epoch: {}, Test set ELBO: {}, time elapse for current epoch: {}'
-                .format(epoch, elbo, end_time - start_time))
-
-            # Save generated images
-            if generation:
-                util.generate_images_from_images(self, test_sample, flow=True,
-                    path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
-                util.generate_images_from_random(self, random_vector_for_generation, 
-                    path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
-            # Save model
-            if epoch == epochs:
-                self.encoder.save_weights(self.file_path + 'encoder/encoder')
-                self.decoder.save_weights(self.file_path + 'decoder/decoder')
-                for i in range(self.num_flow):
-                    self.arnets[i].save_weights(self.file_path +'arnet'+str(i)+'/arnet'+str(i))
-
-
-
-class VAE_HSC(VAE_Flow):
-    """variational autoencoder using Hamiltonian score climbing assisted by flows."""
+class VAE_HSC(VAE):
+    """variational autoencoder using Hamiltonian score climbing."""
     
     def __init__(self, latent_dim, num_flow=5, num_samp=1, hmc_e=0.25, hmc_L=4, 
                  batch_size=32, train_size=60000):
@@ -238,7 +187,7 @@ class VAE_HSC(VAE_Flow):
             state_gradients_are_stopped=True)
         self.hmc_kernel = tfp.mcmc.SimpleStepSizeAdaptation(
             inner_kernel=self.hmc_kernel, 
-            num_adaptation_steps=self.num_samp, 
+            num_adaptation_steps=1, 
             target_accept_prob=0.75,
             adaptation_rate=0.1)
         self.hmc_points = self.pz.sample(train_size).numpy()
@@ -267,26 +216,29 @@ class VAE_HSC(VAE_Flow):
             state_gradients_are_stopped=True)
         self.hmc_kernel = tfp.mcmc.SimpleStepSizeAdaptation(
             inner_kernel=self.hmc_kernel, 
-            num_adaptation_steps=self.num_samp, 
+            num_adaptation_steps=1, 
             target_accept_prob=0.75,
             adaptation_rate=0.1)
     
     def get_current_state(self, idx):
-        if not self.in_first_epoch:
-            if idx + self.batch_size >= self.train_size:
-                return self.f_tot.inverse(self.hmc_points[idx:, :])
-            else:
-                return self.f_tot.inverse(self.hmc_points[idx:(idx+self.batch_size), :])
-        else:
-            return self.q_base.sample(1)
-            
         # if not self.in_first_epoch:
-        #     return self.q_base.sample(1)
-        # else:
-        #     if idx == 0:
-        #         return self.hmc_points[idx:(idx+self.batch_size), :]
+        #     if idx + self.batch_size >= self.train_size:
+        #         return self.f_tot.inverse(self.hmc_points[idx:, :])
         #     else:
-        #         return self.q_base.sample(1)
+        #         return self.f_tot.inverse(self.hmc_points[idx:(idx+self.batch_size), :])
+        # else:
+        #     if idx + self.batch_size >= self.train_size:
+        #         return self.hmc_points[idx:, :]
+        #     else:
+        #         return self.hmc_points[idx:(idx+self.batch_size), :]
+            
+        if not self.in_first_epoch:
+            return self.q_base.sample(1)
+        else:
+            if idx == 0:
+                return self.hmc_points[idx:(idx+self.batch_size), :]
+            else:
+                return self.hmc_points[idx:(idx+self.batch_size), :] 
         
     def modify_current_state(self, idx, zt):
         if idx + self.batch_size >= self.train_size:
@@ -294,7 +246,7 @@ class VAE_HSC(VAE_Flow):
         else:
             self.hmc_points[idx:(idx+self.batch_size), :] = zt.numpy()
     
-    def compute_loss(self, x, idx):
+    def compute_loss(self, x, idx, zt=None):
         mean, logvar = self.encode(x)
         self.q_base = tfd.MultivariateNormalDiag(
                 loc=mean, scale_diag=tf.exp(logvar/2))
@@ -302,63 +254,62 @@ class VAE_HSC(VAE_Flow):
             distribution=self.q_base,
             bijector=self.f_tot)
         
-        self.x_batch = x
-        self.current_state_batch = tf.squeeze(self.get_current_state(idx))
-        out = tfp.mcmc.sample_chain(
-            1, self.current_state_batch, 
-            previous_kernel_results=None, kernel=self.hmc_kernel,
-            num_burnin_steps=self.num_samp, num_steps_between_results=0, 
-            trace_fn=(lambda current_state, kernel_results: kernel_results), 
-            return_final_kernel_results=False, seed=None, name=None)
-        kernel_results = out[1]
-        self.adapted_step_sizes.append(kernel_results.inner_results.accepted_results.step_size.numpy())
-        z0 = tf.gather(out[0], 0)
-        zt = self.f_tot.forward(z0)
-        z0 = tf.stop_gradient(z0)
-        zt = tf.stop_gradient(zt)
+        if zt is None:
+            self.x_batch = x
+            self.current_state_batch = tf.squeeze(self.get_current_state(idx))
+            out = tfp.mcmc.sample_chain(
+                self.num_samp, self.current_state_batch, 
+                previous_kernel_results=None, kernel=self.hmc_kernel,
+                num_burnin_steps=1, num_steps_between_results=0, 
+                trace_fn=(lambda current_state, kernel_results: kernel_results), 
+                return_final_kernel_results=False, seed=None, name=None)
+            kernel_results = out[1]
+            z0 = tf.reshape(out[0], (self.num_samp*self.batch_size, self.latent_dim))
+            zt = self.f_tot.forward(z0)
+            zt_current = self.f_tot.forward(tf.gather(out[0], self.num_samp-1))
+            z0 = tf.stop_gradient(z0)
+            zt = tf.stop_gradient(zt)
+            self.adapted_step_sizes.append(kernel_results.inner_results.accepted_results.step_size.numpy()[-1])
+            self.is_accepted = np.mean(np.squeeze(kernel_results.inner_results.is_accepted.numpy()))
+            self.is_accepted_list.append(self.is_accepted)
+            self.modify_current_state(idx, zt_current)
 
+        z0 = self.f_tot.inverse(zt)
         x_logit = self.decode(zt)
-        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(logits=x_logit, labels=x)
+        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(logits=x_logit, labels=tf.tile(x, (self.num_samp, 1, 1, 1)))
         logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
-        logqz_x = self.q.log_prob(zt)
+        logqz_x = util.log_normal_pdf(z0, tf.tile(mean, (self.num_samp, 1)), tf.tile(logvar, (self.num_samp, 1))) \
+            - self.f_tot.forward_log_det_jacobian(z0, 1)
 
-        self.is_accepted = np.mean(np.squeeze(kernel_results.inner_results.is_accepted.numpy()))
-        self.is_accepted_list.append(self.is_accepted)
-        self.modify_current_state(idx, zt)
-            
-        return -tf.reduce_mean(logpx_z + logqz_x)
+        loss = -tf.reduce_mean(logpx_z + logqz_x)
+        
+        return loss, zt
 
     def warm_up_compute_loss(self, x):
         mean, logvar = self.encode(x)
         z = self.reparameterize(mean, logvar)
-        zt = self.flow(z)
-        x_logit = self.decode(zt)
+        z = self.f_tot.forward(z)
+        x_logit = self.decode(z)
         cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(logits=x_logit, labels=x)
         logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
-        logpz = log_normal_pdf(zt, 0., 0.)
-        q = tfd.TransformedDistribution(
-            distribution=tfd.MultivariateNormalDiag(
-                loc=mean, scale_diag=tf.exp(logvar/2)),
-            bijector=self.f_tot)
-        logqz_x = q.log_prob(zt)
+        logpz = util.log_normal_pdf(z, 0., 0.)
+        logqz_x = util.log_normal_pdf(z, mean, logvar) - self.f_tot.forward_log_det_jacobian(z, 1)
         
         return -tf.reduce_mean(logpx_z + logpz - logqz_x)
     
-    def train_step(self, x, optimizer, idx):
+    def train_step(self, x, optimizer, idx, zt=None):
         with tf.GradientTape() as tape:
-            loss = self.compute_loss(x, idx)
+            loss, zt = self.compute_loss(x, idx, zt=zt)
         gradients = tape.gradient(loss, self.trainable_variables)
         optimizer.apply_gradients(zip(gradients, self.trainable_variables))
         
-        return loss
+        return loss, zt
 
     def warm_up_train_step(self, x, optimizer):
-        #self.decoder.trainable = False
         with tf.GradientTape() as tape:
             loss = self.warm_up_compute_loss(x)
         gradients = tape.gradient(loss, self.trainable_variables)
         optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-        #self.decoder.trainable = True
 
         return loss
 
@@ -367,30 +318,34 @@ class VAE_HSC(VAE_Flow):
         self.write_results_helper('results/vae_hsc/')
         rp = open(self.file_path + "run_parameters.txt", "w")
         rp.write('Latent dimension: ' + str(self.latent_dim) + '\n')
+        rp.write('Number of flows: ' + str(self.num_flow) + '\n')
         rp.write('Number of epochs: ' + str(epochs) + '\n')
         rp.write('Learning rate: ' + str(lr) + '\n')
         rp.write('Batch size: ' + str(self.batch_size) + '\n')
         rp.write('HMC number of samples: ' + str(self.num_samp) + '\n')
         rp.write('HMC step size: ' + str(self.hmc_e) + '\n')
         rp.write('HMC number of leapfrog steps: ' + str(self.hmc_L) + '\n')
+        rp.write('Warn up with ELBO training: ' + str(warm_up) + '\n')
         rp.close()
 
         # Training
         optimizer = tf.keras.optimizers.Adam(lr)
         start_epoch = 1
         self.in_first_epoch = True
+        hmc_zt = None
 
         if load_path is not None:
             start_epoch = load_epoch
             self.in_first_epoch = False
             self.encoder.load_weights(load_path + 'models/epoch_'+str(load_epoch-1)+'_encoder/encoder')
             self.decoder.load_weights(load_path + 'models/epoch_'+str(load_epoch-1)+'_decoder/decoder')
-            for i in range(model_hsc.num_flow):
+            for i in range(self.num_flow):
                 self.arnets[i].load_weights(load_path +'models/epoch_'+str(load_epoch-1)+'_arnet_'+str(i)+'/arnet'+str(i))
             self.hmc_points = np.genfromtxt(load_path +'hmc-points/hmc_points_'+str(load_epoch-1)+'.csv')
 
         if warm_up:
             start_epoch = 11
+            self.in_first_epoch = False
             for epoch in range(1, start_epoch):
                 print('-- Epoch (warm up) {} --'.format(epoch))
                 for train_x in train_dataset:
@@ -398,7 +353,7 @@ class VAE_HSC(VAE_Flow):
                     print('ELBO', round(-loss.numpy(), 3))
                 # Save generated images
                 if generation:
-                    util.generate_images_from_images(self, test_sample, flow=True,
+                    util.generate_images_from_images(self, test_sample,
                         path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
                     util.generate_images_from_random(self, random_vector_for_generation, 
                         path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
@@ -407,14 +362,20 @@ class VAE_HSC(VAE_Flow):
             print('-- Epoch {} --'.format(epoch))
             idx = 0
             self.adapted_step_sizes = []
+
             for train_x in train_dataset:
-                start_time = datetime.datetime.now()
                 if idx >= stop_idx:
                     break
-                loss = self.train_step(train_x, optimizer, idx)
+
+                start_time = datetime.datetime.now()
+                loss, hmc_zt = self.train_step(train_x, optimizer, idx, zt=None)
+                if False:
+                    for _ in range(1):
+                        loss, hmc_zt_ = self.train_step(train_x, optimizer, idx, zt=hmc_zt)
                 idx += self.batch_size
                 self.reset_hmc_kernel(tf.squeeze(self.adapted_step_sizes[-1]))
                 end_time = datetime.datetime.now()
+                
                 if idx % (self.batch_size*1) == 0:
                     print('Loss', round(loss.numpy(), 3), 
                           'accept rate', round(self.is_accepted, 3),
@@ -424,7 +385,7 @@ class VAE_HSC(VAE_Flow):
 
             # Save generated images
             if generation:
-                util.generate_images_from_images(self, test_sample, flow=True,
+                util.generate_images_from_images(self, test_sample,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
                 util.generate_images_from_random(self, random_vector_for_generation, 
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
@@ -443,7 +404,7 @@ class VAE_HSC(VAE_Flow):
             if self.latent_dim == 2 and generation:
                 if epoch == start_epoch:
                     old_points = None
-                old_points = util.plot_hmc_points(self.hmc_points[[0,30000,59999],:], old_points,
+                old_points = util.plot_hmc_points(self.hmc_points[[0,1000,1999],:], old_points,
                     path=self.file_path + 'hmc-points/epoch-'+str(epoch)+'.png')
 
         return

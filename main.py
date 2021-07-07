@@ -20,6 +20,10 @@ def parse_args():
     parser.add_argument('--space',
                         help='for HSC (VI with KLpq) and HMC only, please choose from: {eps, theta}.',
                         default='eps')
+    parser.add_argument('--vae_num_flow',
+                       help='Number of flows to stack in VAE. For no flow (i.e. Gaussian), type 0.',
+                       type=int,
+                       default=0)
     parser.add_argument('--epochs',
                        help='VI total training epochs.',
                        type=int,
@@ -35,7 +39,7 @@ def parse_args():
     parser.add_argument('--latent_dim',
                         help='VAE latent dimension.',
                         type=int,
-                        default=16)
+                        default=2)
     parser.add_argument('--num_samp',
                        help='number of samples in VI methods.',
                        type=int,
@@ -56,9 +60,16 @@ def parse_args():
                        help='HMC number of leapfrog steps.',
                        type=int,
                        default=4)
+    parser.add_argument('--stop_idx',
+                       help='Index after which training data is not used.',
+                       type=int,
+                       default=1e8)
     parser.add_argument('--warm_up', 
                        default=False, 
                        type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--default_path',
+                       help='Redefine default_path to save results (if omitted, there will already be a default path).',
+                       default='na')
     parser.add_argument('--load_path',
                        help='Define load_path if you want to load a trained model.',
                        default='na')
@@ -70,26 +81,37 @@ def parse_args():
     return args
 
 args = parse_args()
+if args.default_path.lower() == 'na':
+    path = None
+else:
+    path = args.default_path
 
 if args.method.lower() == 'vi_klqp':
-    model = models.VI_KLqp(v_fam=args.v_fam.lower())
-    model.target = util.Funnel(2).get_funnel_dist()
-    model.train(epochs=args.epochs, lr=args.lr)
+    model = models.VI_KLqp(
+        dataset=args.dataset, 
+        v_fam=args.v_fam.lower(),
+        num_samp=args.num_samp)
+    model.train(epochs=args.epochs, lr=args.lr, save=True, path=path)
 
 if args.method.lower() == 'vi_klpq':
     model = models.VI_KLpq(
+        dataset=args.dataset,
         v_fam=args.v_fam.lower(), 
         space=args.space.lower(), 
+        num_samp=args.num_samp, 
+        chains=args.chains,
         hmc_e=args.hmc_e, 
         hmc_L=args.hmc_L)
-    model.target = util.Funnel(2).get_funnel_dist()
-    model.train(epochs=args.epochs, lr=args.lr, num_samp=args.num_samp)
+    model.train(epochs=args.epochs, lr=args.lr, save=True, path=path)
 
 if args.method.lower() == 'hmc':
-    model = models.HMC(space=args.space.lower(), iters=args.iters, chains=args.chains, 
-        hmc_e=args.hmc_e, hmc_L=args.hmc_L)
-    model.target = util.Funnel(2).get_funnel_dist()
-    model.run(path='results/checkpoints/iaf_qp')
+    model = models.HMC(
+        space=args.space.lower(), 
+        iters=args.iters, 
+        chains=args.chains, 
+        hmc_e=args.hmc_e, 
+        hmc_L=args.hmc_L)
+    model.run(load_path='results/checkpoints/iaf_qp', save=True, path=path)
 
 if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
     batch_size = args.batch_size
@@ -97,17 +119,15 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
         train_size = 60000
         test_size = 10000
         train_dataset, test_dataset = util.load_mnist(batch_size)
-    random_vector_for_generation = np.genfromtxt('vae_random_vector_' + str(args.latent_dim) + '.csv')
+    random_vector_for_generation = np.genfromtxt('data/vae_random_vector_' + str(args.latent_dim) + '.csv')
     for test_batch in test_dataset.take(1):
         test_sample = test_batch[0:16, :, :, :]
 
-    if args.method.lower() == 'vae' and args.v_fam.lower() == 'gaussian':
-        model = models_vae.VAE(args.latent_dim, batch_size=batch_size)
-        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr,
-            test_sample=test_sample, random_vector_for_generation=random_vector_for_generation)
-
-    if args.method.lower() == 'vae' and (args.v_fam.lower() == 'flow' or args.v_fam.lower() == 'iaf'):
-        model = models_vae.VAE_Flow(args.latent_dim, batch_size=batch_size)
+    if args.method.lower() == 'vae':
+        model = models_vae.VAE(
+            args.latent_dim,
+            num_flow=args.vae_num_flow,
+            batch_size=batch_size)
         model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr,
             test_sample=test_sample, random_vector_for_generation=random_vector_for_generation)
 
@@ -118,12 +138,13 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             load_path = args.load_path
         model = models_vae.VAE_HSC(
             args.latent_dim, 
+            num_flow=args.vae_num_flow,
             num_samp=args.num_samp, 
             hmc_e=args.hmc_e, 
             hmc_L=args.hmc_L,
             batch_size=batch_size,
             train_size=train_size)         
-        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr, stop_idx=train_size, warm_up=args.warm_up,
+        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr, stop_idx=args.stop_idx, warm_up=args.warm_up,
             test_sample=test_sample, random_vector_for_generation=random_vector_for_generation, generation=True,
             load_path=load_path, load_epoch=args.load_epoch)
 
