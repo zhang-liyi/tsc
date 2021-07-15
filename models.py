@@ -435,6 +435,7 @@ class VI_KLpq:
                 previous_kernel_results=None, kernel=self.hmc_kernel,
                 num_burnin_steps=0, num_steps_between_results=0, 
                 trace_fn=(lambda current_state, kernel_results: kernel_results.is_accepted), 
+                parallel_iterations=1000,
                 return_final_kernel_results=False, seed=None, name=None)
             results_is_accepted = out[1]
             if self.space == 'eps' or self.space == 'warped':

@@ -64,8 +64,17 @@ def parse_args():
                        help='Index after which training data is not used.',
                        type=int,
                        default=1e8)
+    parser.add_argument('--shear', 
+                       default=True, 
+                       type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--reinitialize_from_q', 
+                       default=True, 
+                       type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('--warm_up', 
-                       default=False, 
+                       default=True, 
+                       type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--train_encoder', 
+                       default=True, 
                        type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('--default_path',
                        help='Redefine default_path to save results (if omitted, there will already be a default path).',
@@ -119,7 +128,8 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
         train_size = 60000
         test_size = 10000
         train_dataset, test_dataset = util.load_mnist(batch_size)
-    random_vector_for_generation = np.genfromtxt('data/vae_random_vector_' + str(args.latent_dim) + '.csv')
+    random_vector_for_generation = np.genfromtxt(
+        'data/vae_random_vector_' + str(args.latent_dim) + '.csv').astype('float32')
     for test_batch in test_dataset.take(1):
         test_sample = test_batch[0:16, :, :, :]
 
@@ -140,11 +150,15 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             args.latent_dim, 
             num_flow=args.vae_num_flow,
             num_samp=args.num_samp, 
+            chains=args.chains,
             hmc_e=args.hmc_e, 
             hmc_L=args.hmc_L,
             batch_size=batch_size,
-            train_size=train_size)         
+            train_size=train_size,
+            reinitialize_from_q=args.reinitialize_from_q,
+            shear=args.shear)         
         model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr, stop_idx=args.stop_idx, warm_up=args.warm_up,
+            train_encoder=args.train_encoder,
             test_sample=test_sample, random_vector_for_generation=random_vector_for_generation, generation=True,
             load_path=load_path, load_epoch=args.load_epoch)
 
