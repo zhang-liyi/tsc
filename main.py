@@ -4,6 +4,7 @@ import argparse
 import util
 import models
 import models_vae
+import models_vae_tspace
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -40,6 +41,9 @@ def parse_args():
                         help='VAE latent dimension.',
                         type=int,
                         default=2)
+    parser.add_argument('--architecture',
+                        help='Architecture for encoder and decoder.',
+                        default='cnn')
     parser.add_argument('--num_samp',
                        help='number of samples in VI methods.',
                        type=int,
@@ -60,15 +64,23 @@ def parse_args():
                        help='HMC number of leapfrog steps.',
                        type=int,
                        default=4)
-    parser.add_argument('--stop_idx',
-                       help='Index after which training data is not used.',
+    parser.add_argument('--q_factor',
+                       help='Factor to weight q - p during training.',
+                       type=float,
+                       default=1.)
+    parser.add_argument('--q_not_train',
+                       help='Do not train q for __ epochs.',
                        type=int,
-                       default=1e8)
+                       default=0)
+    parser.add_argument('--hmc_e_differs', 
+                       help='Training like Hoffman 2017, where each datapoint has its own step size.',
+                       default=False, 
+                       type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('--shear', 
                        default=True, 
                        type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('--reinitialize_from_q', 
-                       default=True, 
+                       default=False, 
                        type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('--warm_up', 
                        default=True, 
@@ -76,6 +88,10 @@ def parse_args():
     parser.add_argument('--train_encoder', 
                        default=True, 
                        type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--stop_idx',
+                       help='Index after which training data is not used.',
+                       type=int,
+                       default=1e8)
     parser.add_argument('--default_path',
                        help='Redefine default_path to save results (if omitted, there will already be a default path).',
                        default='na')
@@ -94,6 +110,10 @@ if args.default_path.lower() == 'na':
     path = None
 else:
     path = args.default_path
+if args.load_path.lower() == 'na':
+    load_path = None
+else:
+    load_path = args.load_path
 
 if args.method.lower() == 'vi_klqp':
     model = models.VI_KLqp(
@@ -111,7 +131,8 @@ if args.method.lower() == 'vi_klpq':
         chains=args.chains,
         hmc_e=args.hmc_e, 
         hmc_L=args.hmc_L)
-    model.train(epochs=args.epochs, lr=args.lr, save=True, path=path)
+    model.train(epochs=args.epochs, lr=args.lr, 
+        save=True, path=path, load_path=load_path, load_epoch=args.load_epoch)
 
 if args.method.lower() == 'hmc':
     model = models.HMC(
@@ -137,28 +158,30 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
         model = models_vae.VAE(
             args.latent_dim,
             num_flow=args.vae_num_flow,
-            batch_size=batch_size)
+            batch_size=batch_size,
+            num_samp=args.num_samp,
+            architecture=args.architecture.lower())
         model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr,
             test_sample=test_sample, random_vector_for_generation=random_vector_for_generation)
 
     if args.method.lower() == 'vae_hsc':
-        if args.load_path.lower() == 'na':
-            load_path = None
-        else:
-            load_path = args.load_path
         model = models_vae.VAE_HSC(
             args.latent_dim, 
             num_flow=args.vae_num_flow,
+            space=args.space.lower(),
             num_samp=args.num_samp, 
+            architecture=args.architecture.lower(),
             chains=args.chains,
             hmc_e=args.hmc_e, 
             hmc_L=args.hmc_L,
+            q_factor=args.q_factor,
             batch_size=batch_size,
             train_size=train_size,
             reinitialize_from_q=args.reinitialize_from_q,
+            hmc_e_differs=args.hmc_e_differs,
             shear=args.shear)         
-        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr, stop_idx=args.stop_idx, warm_up=args.warm_up,
-            train_encoder=args.train_encoder,
+        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr, stop_idx=args.stop_idx, 
+            warm_up=args.warm_up, q_not_train=args.q_not_train, train_encoder=args.train_encoder,
             test_sample=test_sample, random_vector_for_generation=random_vector_for_generation, generation=True,
             load_path=load_path, load_epoch=args.load_epoch)
 

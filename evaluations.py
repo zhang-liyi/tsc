@@ -5,8 +5,6 @@ from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
 import tensorflow.keras as tfk
 import tensorflow.keras.layers as tfkl
-import datetime
-import os
 
 import util
 
@@ -16,7 +14,7 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 class AIS:
 
-	def __init__(self, init_points, num_anneal_steps=10, hmc_e=0.005, hmc_L=25, num_samp=4):
+	def __init__(self, init_points, num_anneal_steps=10, hmc_e=0.01, hmc_L=25, num_samp=4, num_chains=1):
 		self.current_state = init_points
 		self.num_anneal_steps = num_anneal_steps
 		self.hmc_e = hmc_e 
@@ -59,7 +57,7 @@ class AIS:
 			self.log_weights[t-1] = log_weight.numpy()
 
 			print('Anealing step ' + str(t) + '\n', 
-				  'Acceptance rate', np.mean(np.squeeze(out[1].is_accepted.numpy()), axis=0))
+				  'Acceptance rate', np.mean(np.squeeze(out[1].is_accepted.numpy())))
 
 		return self.log_weights[self.num_anneal_steps-1]
 
