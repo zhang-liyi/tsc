@@ -1,4 +1,4 @@
-# hsc
+# HSC
 
 Requires:
 * Tensorflow 2.x
