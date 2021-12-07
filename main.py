@@ -4,7 +4,6 @@ import argparse
 import util
 import models
 import models_vae
-import models_vae_tspace
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -33,6 +32,10 @@ def parse_args():
                        help='learning rate (of the initial epoch).',
                        type=float,
                        default=0.1)
+    parser.add_argument('--decay_rate',
+                       help='lr decay rate in inverse time decay.',
+                       type=float,
+                       default=0.001)
     parser.add_argument('--batch_size',
                        help='batch size.',
                        type=int,
@@ -64,6 +67,10 @@ def parse_args():
                        help='HMC number of leapfrog steps.',
                        type=int,
                        default=4)
+    parser.add_argument('--hmc_L_cap',
+                       help='Cap on HMC number of leapfrog steps.',
+                       type=int,
+                       default=4)
     parser.add_argument('--q_factor',
                        help='Factor to weight q - p during training.',
                        type=float,
@@ -72,6 +79,10 @@ def parse_args():
                        help='Do not train q for __ epochs.',
                        type=int,
                        default=0)
+    parser.add_argument('--target_accept',
+                       help='Target acceptance rate.',
+                       type=float,
+                       default=0.67)
     parser.add_argument('--hmc_e_differs', 
                        help='Training like Hoffman 2017, where each datapoint has its own step size.',
                        default=False, 
@@ -87,6 +98,9 @@ def parse_args():
                        type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('--train_encoder', 
                        default=True, 
+                       type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--natural_gradient', 
+                       default=False, 
                        type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('--stop_idx',
                        help='Index after which training data is not used.',
@@ -120,7 +134,7 @@ if args.method.lower() == 'vi_klqp':
         dataset=args.dataset, 
         v_fam=args.v_fam.lower(),
         num_samp=args.num_samp)
-    model.train(epochs=args.epochs, lr=args.lr, save=True, path=path)
+    model.train(epochs=args.epochs, lr=args.lr, decay_rate=args.decay_rate, save=True, path=path)
 
 if args.method.lower() == 'vi_klpq':
     model = models.VI_KLpq(
@@ -131,7 +145,7 @@ if args.method.lower() == 'vi_klpq':
         chains=args.chains,
         hmc_e=args.hmc_e, 
         hmc_L=args.hmc_L)
-    model.train(epochs=args.epochs, lr=args.lr, 
+    model.train(epochs=args.epochs, lr=args.lr, decay_rate=args.decay_rate, natural_gradient=args.natural_gradient,
         save=True, path=path, load_path=load_path, load_epoch=args.load_epoch)
 
 if args.method.lower() == 'hmc':
@@ -149,6 +163,10 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
         train_size = 60000
         test_size = 10000
         train_dataset, test_dataset = util.load_mnist(batch_size)
+    if args.dataset.lower() == 'mnist_dyn':
+        train_size = 60000
+        test_size = 10000
+        train_dataset, test_dataset = util.load_mnist_dyn(batch_size)
     random_vector_for_generation = np.genfromtxt(
         'data/vae_random_vector_' + str(args.latent_dim) + '.csv').astype('float32')
     for test_batch in test_dataset.take(1):
@@ -174,7 +192,9 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             chains=args.chains,
             hmc_e=args.hmc_e, 
             hmc_L=args.hmc_L,
+            hmc_L_cap=args.hmc_L_cap,
             q_factor=args.q_factor,
+            target_accept=args.target_accept,
             batch_size=batch_size,
             train_size=train_size,
             reinitialize_from_q=args.reinitialize_from_q,

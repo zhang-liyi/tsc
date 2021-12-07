@@ -8,6 +8,7 @@ import tensorflow.keras as tfk
 import tensorflow.keras.layers as tfkl
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
+import pandas as pd
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
@@ -36,11 +37,28 @@ def preprocess_images(images):
     images = images.reshape((images.shape[0], 28, 28, 1)) / 255.
     return np.where(images > .5, 1.0, 0.0).astype('float32')
 
-def load_mnist(batch_size=32):
-    (train_images, _), (test_images, _) = tf.keras.datasets.mnist.load_data()
+def load_mnist(batch_size=32, return_labels=False):
+    (train_images, train_labels), (test_images, test_labels) = tf.keras.datasets.mnist.load_data()
     train_images = preprocess_images(train_images)
     test_images = preprocess_images(test_images)
 
+    train_size = 60000
+    test_size = 10000
+
+    train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
+                     .shuffle(train_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
+    test_dataset = (tf.data.Dataset.from_tensor_slices(test_images)
+                    .shuffle(test_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
+
+    if not return_labels:
+        return train_dataset, test_dataset
+    else:
+        return train_dataset, train_labels, test_dataset, test_labels
+
+def load_mnist_dyn(batch_size=32):
+    train_images = pd.read_pickle('data/mnist_dyn_train.pickle')
+    test_images = pd.read_pickle('data/mnist_dyn_test.pickle')
+    
     train_size = 60000
     test_size = 10000
 
@@ -56,6 +74,33 @@ def log_normal_pdf(sample, mean, logvar, raxis=1):
     return tf.reduce_sum(
         -.5 * ((sample - mean) ** 2. * tf.exp(-logvar) + logvar + log2pi),
         axis=raxis)
+
+def E_log_normal_hessian(mean, sig):
+    d = mean.shape[0]
+    diag_mumu = -1 / (sig**2)
+    diag_sigsig = -2 / (sig**2)
+    diag = tf.concat([diag_mumu, diag_sigsig], axis=0)
+    zeros = tf.zeros((2*d, 2*d))
+    hessian = tf.linalg.set_diag(zeros, diag)
+    return hessian
+
+def log_normal_hessian(sample, mean, sig):
+    n = sample.shape[0]
+    if len(mean.shape) < 2:
+        mean = tf.expand_dims(mean, axis=0)
+    if len(sig.shape) < 2:
+        sig = tf.expand_dims(sig, axis=0)
+    diag_mumu = -1 / (sig**2)
+    diag_sigsig = 1 / (sig**2) - 3 / (sig**4) * (sample-mean)**2
+    diag_musig = 2 / (sig**3) * (mean-sample)
+    zeros = tf.zeros((n, sample.shape[1], sample.shape[1]))
+    mat_mumu = tf.linalg.set_diag(zeros, tf.tile(diag_mumu, (n, 1)))
+    mat_musig = tf.linalg.set_diag(zeros, diag_musig)
+    mat_sigsig = tf.linalg.set_diag(zeros, diag_sigsig)
+    mat_upper = tf.concat([mat_mumu, mat_musig], axis=2)
+    mat_lower = tf.concat([mat_musig, mat_sigsig], axis=2)
+    hessian = tf.concat([mat_upper, mat_lower], axis=1)
+    return hessian
 
 def generate_images_from_images(model, test_sample, path=None):
     mean, logvar = model.encode(test_sample)

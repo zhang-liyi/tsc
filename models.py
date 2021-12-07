@@ -28,8 +28,8 @@ class VI_KLqp:
         self.train_size = train_size
         if self.dataset == 'funnel':
             self.num_dims = num_dims
-            self.loc_init = [2.,5.]
-            self.scale_init = [1.,1.]
+            self.loc_init = loc_init
+            self.scale_init = scale_init
         elif self.dataset == 'survey':
             self.num_dims = 123
             self.loc_init = tf.zeros(self.num_dims)
@@ -133,14 +133,16 @@ class VI_KLqp:
     def kl_loss(self):
         eps = self.base_distribution.sample(self.num_samp)
         if self.v_fam == 'flow' or self.v_fam == 'iaf':
+            logqz_x = tf.reduce_mean(util.log_normal_pdf(eps, 0., 0.) - self.bij.forward_log_det_jacobian(eps, 1))
             z = self.bij.forward(eps)
         elif self.v_fam == 'gaussian':
             z = self.phi_m + self.phi_s * eps
+            logqz_x = tf.reduce_mean(util.log_normal_pdf(z, self.phi_m, 2 * tf.math.log(self.phi_s)))
         if self.dataset == 'funnel':
-            loss = tf.reduce_mean(self.q.log_prob(z) - 
+            loss = tf.reduce_mean(logqz_x - 
                 self.likelihood.log_prob(z))
         elif self.dataset == 'survey':
-            loss = tf.reduce_mean(self.q.log_prob(z) - 
+            loss = tf.reduce_mean(logqz_x - 
                 self.likelihood(z) - self.prior(z))
         return loss
     
@@ -162,9 +164,9 @@ class VI_KLqp:
                 lst[4].append(self.sigma.numpy())
         return lst
     
-    def train(self, epochs=int(1e5), lr=0.001, decay_rate=0.95, save=True, path=None):
+    def train(self, epochs=int(1e5), lr=0.001, decay_rate=0.001, save=True, path=None):
 
-        lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(lr, 1000, decay_rate)
+        lr_schedule = tf.keras.optimizers.schedules.InverseTimeDecay(lr, 1, decay_rate)
         optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
         phi_m = []
         phi_s = []
@@ -386,7 +388,7 @@ class VI_KLpq:
         if self.dataset == 'funnel':
             return 0, -logqz_x # Just KL(pq)
         elif self.dataset == 'survey':
-            return -tf.reduce_mean(self.likelihood(z)) - tf.reduce_mean(self.prior(z)), -logqz_x            
+            return -tf.reduce_mean(self.likelihood(z)) - tf.reduce_mean(self.prior(z)), -logqz_x           
     
     def make_model(self):
         x_in = tfkl.Input(shape=(self.num_dims,), dtype=tf.float32) # eps
@@ -407,7 +409,7 @@ class VI_KLpq:
     def reset_hmc_kernel(self):
         if self.is_accepted > 0.9:
             self.hmc_e = min(self.hmc_e * 1.01, 1.)
-        else:
+        elif self.is_accepted < 0.67:
             self.hmc_e = self.hmc_e * 0.99
         self.hmc_L = min(max(1, int(1 / self.hmc_e)), 33)
 
@@ -435,13 +437,15 @@ class VI_KLpq:
                 lst[4].append(self.sigma.numpy())
         return lst
 
-    def train(self, epochs=int(1e5), lr=0.001, decay_rate=0.95, save=True, path=None, load_path=None, load_epoch=1):
+    def train(self, epochs=int(1e5), lr=0.001, decay_rate=0.001, natural_gradient=False, save=True, path=None, load_path=None, load_epoch=1):
 
-        lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(lr, 1000, decay_rate)
+        lr_schedule = tf.keras.optimizers.schedules.InverseTimeDecay(lr, 1, decay_rate)
         optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
         if self.dataset == 'survey' and (self.v_fam == 'iaf' or self.v_fam == 'flow'):
-            lr_schedule_q_flow = tf.keras.optimizers.schedules.ExponentialDecay(lr/30, 1000, 0.975)
+            lr_schedule_q_flow = tf.keras.optimizers.schedules.InverseTimeDecay(lr/30, 1, decay_rate)
             optimizer_q = tf.keras.optimizers.Adam(learning_rate=lr_schedule_q_flow)
+        if natural_gradient:
+            optimizer = tf.keras.optimizers.SGD(learning_rate=lr_schedule)
     
         phi_m = []
         phi_s = []
@@ -501,11 +505,16 @@ class VI_KLpq:
                 parallel_iterations=1000,
                 return_final_kernel_results=False, seed=None, name=None)
             results_is_accepted = out[1]
+            out = out[0]
+            if len(out.shape) > 2:
+                out = tf.squeeze(out, axis=0)
+            if len(out.shape) < 2:
+                out = tf.expand_dims(out, axis=0)
             if self.space == 'eps' or self.space == 'warped':
-                eps = tf.gather(out[0], self.num_samp-1)
+                eps = out
                 z = self.bij.forward(eps)
             else:
-                z = tf.gather(out[0], self.num_samp-1)
+                z = out
             z = tf.stop_gradient(z)
             
             params = self.record_data(params)
@@ -513,9 +522,11 @@ class VI_KLpq:
             is_accepted += np.mean(np.squeeze(results_is_accepted.numpy()))
             self.is_accepted = is_accepted/(epoch+1)
 
+            z_in = tf.gather(z, [self.num_samp-1])
+
             with tf.GradientTape(persistent=True) as tape:
                 
-                loss_p, loss_q = self.loss(z)
+                loss_p, loss_q = self.loss(z_in)
                 loss_value = loss_p + loss_q
                 
             if self.dataset == 'survey' and (self.v_fam == 'iaf' or self.v_fam == 'flow'):
@@ -525,6 +536,15 @@ class VI_KLpq:
                 optimizer_q.apply_gradients(zip(grads_q, self.trainable_var_q))
             else:
                 grads = tape.gradient(loss_value, self.trainable_var)
+
+                if natural_gradient:
+                    grads = tf.expand_dims(tf.concat(list(grads), axis=0), axis=0)
+                    F = tf.stop_gradient(
+                        - util.E_log_normal_hessian(self.phi_m, self.phi_s))
+                    grads = tf.matmul(tf.linalg.inv(F), tf.transpose(grads))
+                    grads = tf.squeeze(grads)
+                    grads = tf.split(grads, [self.num_dims, self.num_dims])
+
                 optimizer.apply_gradients(zip(grads, self.trainable_var))
 
             del tape
@@ -536,11 +556,11 @@ class VI_KLpq:
                     self.bij = tfb.Affine(
                         shift=self.phi_m,
                         scale_diag=self.phi_s)
-                self.current_state = self.bij.inverse(z)
+                self.current_state = self.bij.inverse(tf.gather(z, [self.num_samp-1]))
             else:
-                self.current_state = z
+                self.current_state = tf.gather(z, [self.num_samp-1])
 
-            if epoch > 100:
+            if epoch > 10000 and self.dataset == 'survey':
                 self.reset_hmc_kernel()
 
             end = datetime.datetime.now()
@@ -594,11 +614,11 @@ class VI_KLpq:
                     rp.write('variational family: ' + self.v_fam + '\n')
                     rp.write('epochs: ' + str(epochs) + '\n')
                     rp.write('learning rate: ' + str(lr) + '\n')
+                    rp.write('number of samples: ' + str(self.num_samp) + '\n')
                     rp.write('HMC space: ' + self.space + '\n')
                     rp.write('HMC step size e: ' + str(self.hmc_e) + '\n')
                     rp.write('HMC number of leapfrog steps L: ' + str(self.hmc_L) + '\n')
                     rp.write('HMC number of chains: ' + str(self.chains) + '\n')
-                    rp.write('acceptance rate: ' +str( round(is_accepted/(epochs),3) ) + '\n')
                     rp.close()
 
 

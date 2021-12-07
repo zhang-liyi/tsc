@@ -14,8 +14,6 @@ from copy import deepcopy
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 
-print('Running version ' + str(2))
-
 
 class VAE(tf.keras.Model):
     """variational autoencoder, with the option of adding flow."""
@@ -201,8 +199,8 @@ class VAE_HSC(VAE):
     """variational autoencoder using Hamiltonian score climbing."""
     
     def __init__(self, latent_dim, num_flow=5, space='original', architecture='cnn', 
-                 num_samp=1, chains=1, hmc_e=0.25, hmc_L=4, q_factor=1.,
-                 batch_size=32, train_size=60000, 
+                 num_samp=1, chains=1, hmc_e=0.25, hmc_L=4, hmc_L_cap=4,
+                 q_factor=1., batch_size=32, train_size=60000, target_accept=0.67, 
                  hmc_e_differs=False, reinitialize_from_q=False, shear=True):
         super().__init__(latent_dim, num_flow=num_flow, batch_size=batch_size)
         self.space = space
@@ -211,6 +209,8 @@ class VAE_HSC(VAE):
         self.hmc_e_differs = hmc_e_differs
         self.hmc_e = hmc_e
         self.hmc_L = hmc_L # self.hmc_L = min(max(int(1 / hmc_e), 1), 25)
+        self.hmc_L_cap = hmc_L_cap
+        self.target_accept = target_accept
         self.q_factor = q_factor
         self.q_factor_variable = self.q_factor < 0
         self.train_size = train_size
@@ -307,11 +307,11 @@ class VAE_HSC(VAE):
     def reset_hmc_kernel(self):
         smallest_accept = np.min(self.is_accepted)
         average_accept = np.mean(self.is_accepted)
-        if smallest_accept < 0.25 or average_accept < 0.67:
+        if smallest_accept < 0.25 or average_accept < self.target_accept:
             self.hmc_e = self.hmc_e * 0.97
         else:
             self.hmc_e = min(self.hmc_e * 1.03, 1.)
-        self.hmc_L = min(int(1 / self.hmc_e)+1, 4)
+        self.hmc_L = min(int(1 / self.hmc_e)+1, self.hmc_L_cap)
 
         if self.hmc_e_differs:
             self.hmc_e_M = tf.exp(self.logvar / 2) * self.hmc_e
@@ -359,6 +359,24 @@ class VAE_HSC(VAE):
             self.hmc_points[idx:, :] = zt.numpy()
         else:
             self.hmc_points[idx:(idx+self.batch_size*self.chains), :] = zt.numpy()
+
+    def get_loss_q_from_q_sample(self, x):
+        z0_from_q = self.reparameterize(
+            self.mean, 
+            self.logvar)
+        zt_from_q, logdet_from_q = self.flow_model(z0_from_q)
+        x_logit_from_q = self.decode(zt_from_q)
+        cross_ent_from_q = tf.nn.sigmoid_cross_entropy_with_logits(
+            logits=x_logit_from_q, 
+            labels=x)
+        logpx_z_from_q = -tf.reduce_sum(cross_ent_from_q, axis=[1, 2, 3])
+        logpz_from_q = util.log_normal_pdf(zt_from_q, 0., 0.)
+        logqz_x_from_q = util.log_normal_pdf(
+            z0_from_q, self.mean, self.logvar) - logdet_from_q
+
+        loss_q = -tf.reduce_mean(logpx_z_from_q + logpz_from_q - logqz_x_from_q)
+
+        return loss_q
     
     def compute_loss(self, x, idx):
         mean, logvar = self.encode(x)
@@ -379,18 +397,12 @@ class VAE_HSC(VAE):
             return_final_kernel_results=False, seed=None, name=None)
         kernel_results = out[1]
         z0 = tf.gather(out[0], self.num_samp-1)
-        # all_z0 = tf.reshape(out[0], (-1, self.latent_dim))
 
         if self.space == 'warped' or self.space == 'eps':
             z0 = self.mean + tf.multiply(z0, tf.exp(self.logvar / 2))
-            # all_z0 = tf.tile(self.mean, (self.num_samp, 1)) + \
-            # tf.multiply(all_z0, tf.exp(tf.tile(self.logvar, (self.num_samp, 1)) / 2))
         z0 = tf.stop_gradient(z0)
-        # all_z0 = tf.stop_gradient(all_z0)
         zt, _ = self.flow_model(z0)
         zt = tf.stop_gradient(zt)
-        # all_zt, _ = self.flow_model(all_z0)
-        # all_zt = tf.stop_gradient(all_zt)
         self.is_accepted = np.mean(np.squeeze(kernel_results.numpy()), axis=0)
         self.is_accepted_all_epochs.append(np.mean(self.is_accepted))
         self.modify_current_state(idx, zt)
@@ -401,11 +413,13 @@ class VAE_HSC(VAE):
         cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
             logits=x_logit, labels=tf.tile(x, (self.chains, 1, 1, 1)))
         logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
-        # logqz_x = util.log_normal_pdf(all_z0, tf.tile(self.mean, (self.num_samp, 1)), tf.tile(self.logvar, (self.num_samp, 1))) - logdet
-        logqz_x = util.log_normal_pdf(z0, tf.tile(self.mean, (1, 1)), tf.tile(self.logvar, (1, 1))) - logdet
+        logqz_x = util.log_normal_pdf(z0, self.mean, self.logvar) - logdet
 
         loss_p = -tf.reduce_mean(logpx_z)
-        loss_q = -tf.reduce_mean(logqz_x)
+        if not self.reinitialize_from_q:
+            loss_q = -tf.reduce_mean(logqz_x)
+        else:
+            loss_q = self.get_loss_q_from_q_sample(x)
 
         print('loss_p', np.round(loss_p.numpy(), 3), 'loss_q', np.round(loss_q.numpy(), 3))
         
@@ -432,8 +446,8 @@ class VAE_HSC(VAE):
         optimizer_p.apply_gradients(zip(grads_p, self.decoder.trainable_variables))
 
         if self.training_encoder:
-            grads_q = tape.gradient(loss_q, self.encoder.trainable_variables + self.flow_model.trainable_variables)
-            optimizer_q.apply_gradients(zip(grads_q, self.encoder.trainable_variables + self.flow_model.trainable_variables))
+            grads_q = tape.gradient(loss_q, self.encoder.trainable_variables + self.flow_model.trainable_variables + [self.shearing_param])
+            optimizer_q.apply_gradients(zip(grads_q, self.encoder.trainable_variables + self.flow_model.trainable_variables + [self.shearing_param]))
 
         loss = loss_p + loss_q
 
@@ -476,8 +490,13 @@ class VAE_HSC(VAE):
         rp.close()
 
         # Training
-        optimizer = tf.keras.optimizers.Adam(lr)
-        optimizer_q = tf.keras.optimizers.Adam(lr * self.q_factor)
+        decay_change = (int(self.train_size/self.batch_size) + 1) * 400
+        lr_schedule = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
+            [decay_change], [lr, lr / 10])
+        lr_schedule_q = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
+            [decay_change], [lr * self.q_factor, lr * self.q_factor / 10])
+        optimizer = tf.keras.optimizers.Adam(lr_schedule)
+        optimizer_q = tf.keras.optimizers.Adam(lr_schedule_q)
         hmc_zt = None
         losses = []
         self.decoder.save_weights(self.file_path + 'models/init_decoder/decoder')
@@ -492,7 +511,10 @@ class VAE_HSC(VAE):
             if self.num_flow > 0:
                 self.flow_model.load_weights(load_path + 'warmed_up_flow/flow')
             if self.shear:
-                self.shearing_param = np.genfromtxt(load_path + 'shearing_param.csv')
+                self.shearing_param = tf.Variable(
+                    np.genfromtxt(load_path + 'shearing_param.csv'),
+                    dtype=tf.float32, 
+                    name='shear')
 
         # Load a trained model and continue to train it. Epoch number adds cumulatively.
         elif load_path is not None:
@@ -502,9 +524,12 @@ class VAE_HSC(VAE):
                 self.flow_model.load_weights(
                         load_path + 'models/epoch_' + str(load_epoch-1) + '_flow/flow')
             if self.shear:
-                self.shearing_param = np.genfromtxt(
+                self.shearing_param = tf.Variable(
+                    np.genfromtxt(
                     load_path + 'models/epoch_' + str(load_epoch-1) + '_shearing_param/shearing_param.csv',
-                    dtype='float32')
+                    dtype='float32'),
+                    dtype=tf.float32, 
+                    name='shear')
             self.hmc_points = np.genfromtxt(load_path + 'hmc-points/hmc_points.csv', dtype='float32')
 
         # If we don't load, we can do a warm-up and use the warmed-up encoder.
@@ -512,7 +537,7 @@ class VAE_HSC(VAE):
             os.makedirs('pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/warmed_up_encoder/')
             os.makedirs('pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/warmed_up_flow/')
             if self.num_flow > 0:
-                warm_up_epochs = 100
+                warm_up_epochs = 500
             else:
                 warm_up_epochs = 20
             for epoch in range(1, warm_up_epochs + 1):
@@ -526,7 +551,6 @@ class VAE_HSC(VAE):
                         path=self.file_path + 'generated-images/pre-epoch-'+str(epoch)+'-from-images.png')
                     util.generate_images_from_random(self, random_vector_for_generation, 
                         path=self.file_path + 'generated-images/pre-epoch-'+str(epoch)+'-from-prior.png')
-            self.shearing_param = self.shearing_param.numpy()
             # Save model
             self.encoder.save_weights(
                 'pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/warmed_up_encoder/encoder')
@@ -534,7 +558,7 @@ class VAE_HSC(VAE):
             #     'pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/warmed_up_decoder/decoder')
             self.flow_model.save_weights(
                 'pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/warmed_up_flow/flow')
-            np.savetxt('pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/shearing_param.csv', self.shearing_param)
+            np.savetxt('pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/shearing_param.csv', self.shearing_param.numpy())
 
             self.decoder.load_weights(self.file_path + 'models/init_decoder/decoder')
 
@@ -556,16 +580,7 @@ class VAE_HSC(VAE):
                 self.flow_model.trainable = train_encoder
                 self.training_encoder = train_encoder
 
-            # if epoch <= 20:
-            #     self.reinitialize_from_q = True 
-            # else:
-            #     self.reinitialize_from_q = reinitialize_from_q_setup
-
-            # Set self.q_factor:
-            # if self.q_factor_variable:
-            #     self.q_factor = 0.01 / (self.train_size/self.batch_size) * self.num_samp
-                # self.q_factor = min(1e-6 * epoch ** 3, 1.)
-
+            # Training:
             for train_x in train_dataset:
 
                 # We stop if we only want to train with stop_idx many data points:
@@ -606,10 +621,7 @@ class VAE_HSC(VAE):
                 self.flow_model.save_weights(
                     self.file_path+'models/epoch_' + str(epoch) + '_flow/flow')
                 # np.savetxt(self.file_path + 'hmc_acceptance.csv', np.squeeze(self.is_accepted_list))
-                if epoch == 20:
-                    np.savetxt(self.file_path + 'hmc-points/epoch_20_hmc_points.csv', np.squeeze(self.hmc_points))
-                else:
-                    np.savetxt(self.file_path + 'hmc-points/hmc_points.csv', np.squeeze(self.hmc_points))
+                np.savetxt(self.file_path + 'hmc-points/hmc_points.csv', np.squeeze(self.hmc_points))
                 np.savetxt(self.file_path + 'losses.csv', np.array(losses))
             # Plot HMC points
             # if self.latent_dim == 2 and generation:
