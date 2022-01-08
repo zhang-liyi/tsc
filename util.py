@@ -274,6 +274,24 @@ class RealNVP(tf.keras.models.Model):
 
     
 
+class Affine(tf.keras.models.Model):
+    def __init__(self, num_coupling_layers, num_dims):
+        super(Affine, self).__init__()
+
+        self.num_dims = num_dims
+        self.mu = tf.Variable(tf.zeros(self.num_dims), dtype=tf.float32)
+
+    def call(self, z):
+        x = z
+        logdet = 0.
+       
+        return x, logdet
+
+    def inverse(self, x):
+        z = x
+        logdetinv = 0.
+
+        return z, logdetinv
 
 
 

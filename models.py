@@ -14,7 +14,6 @@ import util
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 
-
 class VI_KLqp:
 
     def __init__(self, dataset='funnel', v_fam='gaussian', num_dims=2, 
@@ -247,9 +246,12 @@ class VI_KLpq:
         self.dataset = dataset.lower()
         if self.dataset == 'funnel':
             self.num_dims = num_dims
-            self.pt_init = tf.tile(pt_init, [chains, 1])
-            self.loc_init = loc_init
-            self.scale_init = scale_init
+            # self.pt_init = tf.tile(pt_init, [chains, 1])
+            # self.loc_init = loc_init
+            # self.scale_init = scale_init
+            self.pt_init = tfd.Sample(tfd.Normal(0,1), self.num_dims).sample(chains)
+            self.loc_init = tf.zeros(self.num_dims)
+            self.scale_init = tf.ones(self.num_dims)
         elif self.dataset == 'survey':
             self.num_dims = 123
             self.pt_init = tfd.Sample(tfd.Normal(0,1), self.num_dims).sample(chains)
@@ -455,7 +457,8 @@ class VI_KLpq:
         params = [phi_m, phi_s, gamma_0, gamma, sigma]
         params_savenames = ['phi_m.csv', 'phi_s.csv', 'gamma_0.csv', 'gamma.csv', 'sigma.csv']
         losses = []
-        hmc_points = []
+        hmc_points = [] # record points directly from HMC, not passed to transport map
+        posterior_stds = [] # record posterior stds (approx) in flow, to monitor convergence
         is_accepted = 0
         if save:
             tm = str(datetime.datetime.now())
@@ -498,6 +501,7 @@ class VI_KLpq:
 
             begin = datetime.datetime.now()
 
+            # --- Get HMC sample ---+
             out = tfp.mcmc.sample_chain(self.num_samp, self.current_state, 
                 previous_kernel_results=None, kernel=self.hmc_kernel,
                 num_burnin_steps=0, num_steps_between_results=0, 
@@ -522,7 +526,9 @@ class VI_KLpq:
             is_accepted += np.mean(np.squeeze(results_is_accepted.numpy()))
             self.is_accepted = is_accepted/(epoch+1)
 
-            z_in = tf.gather(z, [self.num_samp-1])
+            # --- Training ---+
+            # z_in = tf.gather(z, [self.num_samp-1])
+            z_in = z 
 
             with tf.GradientTape(persistent=True) as tape:
                 
@@ -551,20 +557,22 @@ class VI_KLpq:
 
             losses.append(loss_value.numpy())
             
+            # --- Update current state for hmc kernel ---+
             if self.space == 'eps' or self.space == 'warped':
                 if self.v_fam == 'gaussian':
                     self.bij = tfb.Affine(
                         shift=self.phi_m,
                         scale_diag=self.phi_s)
-                self.current_state = self.bij.inverse(tf.gather(z, [self.num_samp-1]))
+                self.current_state = self.bij.inverse(z)
             else:
-                self.current_state = tf.gather(z, [self.num_samp-1])
+                self.current_state = z
 
             if epoch > 10000 and self.dataset == 'survey':
                 self.reset_hmc_kernel()
 
             end = datetime.datetime.now()
-                
+
+            # --- Print and save results ---+    
             if epoch % 1 == 0:
                 print(end-begin)
                 if self.dataset == 'funnel':
@@ -579,6 +587,7 @@ class VI_KLpq:
                               'point', np.round(tf.gather(z, 0).numpy(),3), 
                               'phi_s', np.round(self.phi_s.numpy(),3),
                               'acceptance rate', round(self.is_accepted, 3))
+
                 elif self.dataset == 'survey':
                     if self.v_fam == 'iaf' or self.v_fam == 'flow':
                         print('Epoch', epoch, 
@@ -593,11 +602,20 @@ class VI_KLpq:
                               'gamma', np.round(self.gamma.numpy(),3),
                               'phi_s', np.round(np.mean(self.phi_s.numpy()),3),
                               'hmc_e', np.round(self.hmc_e, 3))
+            if epoch % 10 == 0:
+                # Monitor convergence for flow-based distributions:
+                if self.v_fam == 'iaf' or self.v_fam == 'flow':
+                    iaf_pq_samp = self.q.sample(int(1e6))
+                    s = tf.math.reduce_std(iaf_pq_samp, axis=0).numpy()
+                    m = tf.reduce_mean(iaf_pq_samp, axis=0).numpy()
+                    posterior_stds.append(s)
+
             if (epoch % 1000 == 0 or epoch == 1) and save:
                 if epoch == 30000:
                     old_path = path 
                     path += '30000/'
                 np.savetxt(path+'losses.csv', np.array(losses))
+                np.savetxt(path+'posterior_stds.csv', np.array(posterior_stds))
                 # np.savetxt(path+'hmc_points.csv', hmc_points)
                 with open(path+'hmc_points.pickle', 'wb') as handle:
                     pickle.dump(hmc_points, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -614,6 +632,7 @@ class VI_KLpq:
                     rp.write('variational family: ' + self.v_fam + '\n')
                     rp.write('epochs: ' + str(epochs) + '\n')
                     rp.write('learning rate: ' + str(lr) + '\n')
+                    rp.write('decay rate: ' + str(decay_rate) + '\n')
                     rp.write('number of samples: ' + str(self.num_samp) + '\n')
                     rp.write('HMC space: ' + self.space + '\n')
                     rp.write('HMC step size e: ' + str(self.hmc_e) + '\n')

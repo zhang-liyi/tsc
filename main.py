@@ -1,4 +1,5 @@
 import numpy as np
+import tensorflow as tf
 import argparse
 
 import util
@@ -9,7 +10,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
                         description='VI and HMC')
     parser.add_argument('--dataset',
-                        help='benchmark dataset to use.',
+                        help='benchmark dataset to use (funnel / survey / mnist).',
                         default='mnist')
     parser.add_argument('--method',
                         help='method, please choose from: {vi_klqp, vi_klpq, hmc, vae, vae_hsc}.',
@@ -116,10 +117,17 @@ def parse_args():
                        help='Which epoch do you want the loaded model to start trainig at.',
                        type=int,
                        default=1)
+    parser.add_argument('--random_seed',
+                       help='Random seed.',
+                       type=int,
+                       default=42)
     args = parser.parse_args()
     return args
 
 args = parse_args()
+
+tf.random.set_seed(args.random_seed)
+
 if args.default_path.lower() == 'na':
     path = None
 else:
