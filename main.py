@@ -84,8 +84,12 @@ def parse_args():
                        help='Target acceptance rate.',
                        type=float,
                        default=0.67)
+    parser.add_argument('--cis', 
+                       help='Number of samples in conditional importance sampling MSC. If 0, no CIS is used.',
+                       type=int,
+                       default=0)
     parser.add_argument('--hmc_e_differs', 
-                       help='Training like Hoffman 2017, where each datapoint has its own step size.',
+                       help='Training like Hoffman 2017, where each datapoint has its own step size, if True.',
                        default=False, 
                        type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('--shear', 
@@ -171,10 +175,14 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
         train_size = 60000
         test_size = 10000
         train_dataset, test_dataset = util.load_mnist(batch_size)
-    if args.dataset.lower() == 'mnist_dyn':
+    elif args.dataset.lower() == 'mnist_dyn':
         train_size = 60000
         test_size = 10000
         train_dataset, test_dataset = util.load_mnist_dyn(batch_size)
+    elif args.dataset.lower() == 'fashion_mnist':
+        train_size = 60000
+        test_size = 10000
+        train_dataset, test_dataset = util.load_fashion_mnist(batch_size)
     random_vector_for_generation = np.genfromtxt(
         'data/vae_random_vector_' + str(args.latent_dim) + '.csv').astype('float32')
     for test_batch in test_dataset.take(1):
@@ -185,9 +193,10 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             args.latent_dim,
             num_flow=args.vae_num_flow,
             batch_size=batch_size,
-            num_samp=args.num_samp,
+            K=args.num_samp,
             architecture=args.architecture.lower())
-        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr,
+        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr, 
+            load_path=load_path, load_epoch=args.load_epoch,
             test_sample=test_sample, random_vector_for_generation=random_vector_for_generation)
 
     if args.method.lower() == 'vae_hsc':
@@ -195,8 +204,9 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             args.latent_dim, 
             num_flow=args.vae_num_flow,
             space=args.space.lower(),
-            num_samp=args.num_samp, 
+            cis=args.cis,
             architecture=args.architecture.lower(),
+            num_samp=args.num_samp, 
             chains=args.chains,
             hmc_e=args.hmc_e, 
             hmc_L=args.hmc_L,
@@ -208,7 +218,8 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             reinitialize_from_q=args.reinitialize_from_q,
             hmc_e_differs=args.hmc_e_differs,
             shear=args.shear)         
-        model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr, stop_idx=args.stop_idx, 
+        model.train(train_dataset, test_dataset, 
+            epochs=args.epochs, lr=args.lr, stop_idx=args.stop_idx, 
             warm_up=args.warm_up, q_not_train=args.q_not_train, train_encoder=args.train_encoder,
             test_sample=test_sample, random_vector_for_generation=random_vector_for_generation, generation=True,
             load_path=load_path, load_epoch=args.load_epoch)
