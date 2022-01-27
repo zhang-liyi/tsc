@@ -29,8 +29,8 @@ class VI_KLqp:
         self.train_size = train_size
         if self.dataset == 'funnel' or self.dataset == 'banana':
             self.num_dims = num_dims
-            self.loc_init = loc_init
-            self.scale_init = scale_init
+            self.loc_init = tf.zeros(self.num_dims)
+            self.scale_init = tf.ones(self.num_dims)
         elif self.dataset == 'survey':
             self.num_dims = 123
             self.loc_init = tf.zeros(self.num_dims)

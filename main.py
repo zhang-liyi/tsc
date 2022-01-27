@@ -52,6 +52,10 @@ def parse_args():
                        help='number of samples in VI methods.',
                        type=int,
                        default=1)
+    parser.add_argument('--likelihood_sigma',
+                       help='Sigma when VAE likelihood is diagonal Gaussian.',
+                       type=float,
+                       default=1.)
     parser.add_argument('--iters',
                        help='HMC iterations.',
                        type=int,
@@ -183,6 +187,10 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
         train_size = 60000
         test_size = 10000
         train_dataset, test_dataset = util.load_fashion_mnist(batch_size)
+    elif args.dataset.lower() == 'cifar10':
+        train_size = 50000
+        test_size = 10000
+        train_dataset, test_dataset = util.load_cifar10(batch_size)
     random_vector_for_generation = np.genfromtxt(
         'data/vae_random_vector_' + str(args.latent_dim) + '.csv').astype('float32')
     for test_batch in test_dataset.take(1):
@@ -194,10 +202,12 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             num_flow=args.vae_num_flow,
             batch_size=batch_size,
             K=args.num_samp,
-            architecture=args.architecture.lower())
+            dataset=args.dataset.lower(),
+            architecture=args.architecture.lower(),
+            likelihood_sigma=args.likelihood_sigma)
         model.train(train_dataset, test_dataset, epochs=args.epochs, lr=args.lr, 
             load_path=load_path, load_epoch=args.load_epoch,
-            test_sample=test_sample, random_vector_for_generation=random_vector_for_generation)
+            test_sample=test_sample, random_vector_for_generation=random_vector_for_generation, generation=True)
 
     if args.method.lower() == 'vae_hsc':
         model = models_vae.VAE_HSC(
@@ -205,7 +215,9 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             num_flow=args.vae_num_flow,
             space=args.space.lower(),
             cis=args.cis,
+            dataset=args.dataset.lower(),
             architecture=args.architecture.lower(),
+            likelihood_sigma=args.likelihood_sigma,
             num_samp=args.num_samp, 
             chains=args.chains,
             hmc_e=args.hmc_e, 

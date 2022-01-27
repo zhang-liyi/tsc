@@ -12,6 +12,7 @@ from copy import deepcopy
 from util import *
 from dist import *
 from flow import *
+from network import * 
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
@@ -20,7 +21,7 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 class VAE(tf.keras.Model):
     """variational autoencoder, with the option of adding flow."""
 
-    def __init__(self, latent_dim, num_flow=0, batch_size=32, K=1, architecture='cnn'):
+    def __init__(self, latent_dim, num_flow=0, batch_size=32, K=1, dataset='mnist', architecture='cnn', likelihood_sigma=1.):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_flow = num_flow
@@ -28,63 +29,29 @@ class VAE(tf.keras.Model):
         self.K = K # K = 1 is original VAE; K > 1 is IWAE
         self.pz = tfd.Sample(
             tfd.Normal(0., 1.), sample_shape=(latent_dim,))
+        self.likelihood_sigma = likelihood_sigma # Only used when likelihood is Gaussian
+        self.dataset = dataset
         # Define architectures: self.encoder & self.decoder.
         # The final layers should not have activations. Sigmoid, if needed,
         # should be included in later compute_loss or other functions.
-        if architecture == 'cnn':
-            self.encoder = tf.keras.Sequential(
-                [
-                    tf.keras.layers.InputLayer(input_shape=(28, 28, 1)),
-                    tf.keras.layers.Conv2D(
-                        filters=32, kernel_size=3, strides=(2, 2), activation='relu'),
-                    tf.keras.layers.Conv2D(
-                        filters=64, kernel_size=3, strides=(2, 2), activation='relu'),
-                    tf.keras.layers.Flatten(),
-                    tf.keras.layers.Dense(self.latent_dim + self.latent_dim),
-                ]
-            )
-            self.decoder = tf.keras.Sequential(
-                [
-                    tf.keras.layers.InputLayer(input_shape=(self.latent_dim,)),
-                    tf.keras.layers.Dense(units=7*7*32, activation=tf.nn.relu),
-                    tf.keras.layers.Reshape(target_shape=(7, 7, 32)),
-                    tf.keras.layers.Conv2DTranspose(
-                        filters=64, kernel_size=3, strides=2, padding='same',
-                        activation='relu'),
-                    tf.keras.layers.Conv2DTranspose(
-                        filters=32, kernel_size=3, strides=2, padding='same',
-                        activation='relu'),
-                    tf.keras.layers.Conv2DTranspose(
-                        filters=1, kernel_size=3, strides=1, padding='same'),
-                ]
-            )
-        else:
-            self.encoder = tf.keras.Sequential(
-                [
-                    tf.keras.layers.InputLayer(input_shape=(28, 28, 1)),
-                    tf.keras.layers.Reshape(target_shape=(28 * 28,)),
-                    tf.keras.layers.Dense(1024, activation='relu'),
-                    tf.keras.layers.Dense(1024, activation='relu'),
-                    tf.keras.layers.Dense(self.latent_dim + self.latent_dim),
-                ]
-            )
-            self.decoder = tf.keras.Sequential(
-                [
-                    tf.keras.layers.InputLayer(input_shape=(self.latent_dim,)),
-                    tf.keras.layers.Dense(1024, activation='relu'),
-                    tf.keras.layers.Dense(1024, activation='relu'),
-                    tf.keras.layers.Dense(28 * 28),
-                    tf.keras.layers.Reshape(target_shape=(28, 28, 1)),
-                ]
-            )
+        if self.dataset == 'mnist' or self.dataset == 'mnist_dyn' or self.dataset == 'fashion_mnist':
+            if architecture == 'cnn':
+                self.encoder = encoder_cnn_small(self.latent_dim)
+                self.decoder = decoder_cnn_small(self.latent_dim)
+            else:
+                self.encoder = encoder_dense(self.latent_dim)
+                self.decoder = decoder_dense(self.latent_dim)
+        elif self.dataset == 'cifar10':
+            self.encoder = DCGANEncoder(self.latent_dim)
+            self.decoder = DCGANDecoder(self.latent_dim)
         self.flow_model = RealNVP(
             self.num_flow, 
             self.latent_dim)
 
-    def sample(self, eps=None):
+    def sample(self, eps=None, apply_sigmoid=False):
         if eps is None:
             eps = tf.random.normal(shape=(100, self.latent_dim))
-        return self.decode(eps, apply_sigmoid=True)
+        return self.decode(eps, apply_sigmoid=apply_sigmoid)
 
     def encode(self, x):
         mean, logvar = tf.split(self.encoder(x), num_or_size_splits=2, axis=1)
@@ -95,17 +62,24 @@ class VAE(tf.keras.Model):
         return eps * tf.exp(logvar * .5) + mean
 
     def decode(self, z, apply_sigmoid=False):
-        logits = self.decoder(z)
+        x_dec = self.decoder(z)
         if apply_sigmoid:
-            probs = tf.sigmoid(logits)
+            probs = tf.sigmoid(x_dec)
             return probs
-        return logits
+        return x_dec
 
     def log_joint(self, z):
-        x_logit = self.decode(z)
-        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=x_logit, labels=self.x_batch)
-        logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        x_dec = self.decode(z)
+        if self.dataset == 'mnist' or self.dataset == 'mnist_dyn':
+            cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
+                logits=x_dec, 
+                labels=self.x_batch)
+            logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        elif self.dataset == 'fashion_mnist' or self.dataset == 'cifar10':
+            logpx_z = log_normal_pdf(self.x_batch, 
+                x_dec, 
+                tf.math.log(self.likelihood_sigma**2), 
+                raxis=range(1, len(self.x_batch.shape)))
         logpz = self.pz.log_prob(z)
 
         return logpx_z + logpz
@@ -125,12 +99,18 @@ class VAE(tf.keras.Model):
             tf.tile(logvar, (self.K, 1)))
         zt, logdet = self.flow_model(z0)
         # Decode
-        x_logit = self.decode(zt)
-        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=x_logit, 
-            labels=tf.tile(x, (self.K, 1, 1, 1)))
+        x_dec = self.decode(zt)
         # Compute loss
-        logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        if self.dataset == 'mnist' or self.dataset == 'mnist_dyn':
+            cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
+                logits=x_dec, 
+                labels=tf.tile(x, (self.K, 1, 1, 1)))
+            logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        elif self.dataset == 'fashion_mnist' or self.dataset == 'cifar10':
+            logpx_z = log_normal_pdf(tf.tile(x, (self.K, 1, 1, 1)), 
+                x_dec, 
+                tf.math.log(self.likelihood_sigma**2), 
+                raxis=range(1, len(x.shape)))
         logpz = log_normal_pdf(zt, 0., 0.)
         logqz_x = -logdet + log_normal_pdf(
             z0, 
@@ -186,10 +166,16 @@ class VAE(tf.keras.Model):
                 .format(epoch, elbo, end_time - start_time))
 
             # Save generated images
+            if self.dataset == 'cifar10':
+                colored = True 
+            else:
+                colored = False
             if generation:
                 generate_images_from_images(self, test_sample,
+                    colored=colored,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
                 generate_images_from_random(self, random_vector_for_generation, 
+                    colored=colored,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
             # Save model
             if epoch % 5 == 0 or epoch == epochs:
@@ -223,11 +209,12 @@ class VAE_HSC(VAE):
     * CIS-MSC (space='original' and cis > 0)
     """
     
-    def __init__(self, latent_dim, num_flow=5, space='original', cis=0, 
-                 architecture='cnn', num_samp=1, chains=1, hmc_e=0.25, hmc_L=4, hmc_L_cap=4,
+    def __init__(self, latent_dim, num_flow=5, space='original', dataset='mnist',
+                 architecture='cnn', likelihood_sigma=1., cis=0, num_samp=1, chains=1, hmc_e=0.25, hmc_L=4, hmc_L_cap=4,
                  q_factor=1., batch_size=32, train_size=60000, target_accept=0.67, 
                  hmc_e_differs=False, reinitialize_from_q=False, shear=True):
-        super().__init__(latent_dim, num_flow=num_flow, batch_size=batch_size)
+        super().__init__(latent_dim, num_flow=num_flow, batch_size=batch_size,
+            K=1, dataset=dataset, architecture=architecture, likelihood_sigma=likelihood_sigma)
         self.space = space
         self.cis = cis
         self.num_samp = num_samp
@@ -257,10 +244,10 @@ class VAE_HSC(VAE):
         self.is_accepted = [1.]
         self.epoch = 999
 
-    def sample(self, eps=None):
+    def sample(self, eps=None, apply_sigmoid=False):
         if eps is None:
             eps = tf.random.normal(shape=(100, self.latent_dim))
-        return self.decode(eps, apply_sigmoid=True)
+        return self.decode(eps, apply_sigmoid=apply_sigmoid)
 
     def encode(self, x):
         mean, logvar = tf.split(self.encoder(x), num_or_size_splits=2, axis=1)
@@ -297,10 +284,17 @@ class VAE_HSC(VAE):
             return tf.eye(self.latent_dim)
 
     def log_joint(self, z):
-        x_logit = self.decode(z)
-        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=x_logit, labels=tf.tile(self.x_batch, (self.chains, 1, 1, 1)))
-        logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        x_dec = self.decode(z)
+        if self.dataset == 'mnist' or self.dataset == 'mnist_dyn':
+            cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
+                logits=x_dec, 
+                labels=tf.tile(self.x_batch, (self.chains, 1, 1, 1)))
+            logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        elif self.dataset == 'fashion_mnist' or self.dataset == 'cifar10':
+            logpx_z = log_normal_pdf(tf.tile(self.x_batch, (self.chains, 1, 1, 1)), 
+                x_dec, 
+                tf.math.log(self.likelihood_sigma**2), 
+                raxis=range(1, len(self.x_batch.shape)))
         logpz = self.pz.log_prob(z)
 
         return logpx_z + logpz
@@ -323,10 +317,17 @@ class VAE_HSC(VAE):
         else:
             zt = z0 
             flow_logdet = 0.
-        x_logit = self.decode(zt)
-        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=x_logit, labels=tf.tile(self.x_batch, (self.chains, 1, 1, 1)))
-        logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        x_dec = self.decode(zt)
+        if self.dataset == 'mnist' or self.dataset == 'mnist_dyn':
+            cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
+                logits=x_dec, 
+                labels=tf.tile(self.x_batch, (self.chains, 1, 1, 1)))
+            logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        elif self.dataset == 'fashion_mnist' or self.dataset == 'cifar10':
+            logpx_z = log_normal_pdf(tf.tile(self.x_batch, (self.chains, 1, 1, 1)), 
+                x_dec, 
+                tf.math.log(self.likelihood_sigma**2), 
+                raxis=range(1, len(self.x_batch.shape)))
         logpz = self.pz.log_prob(zt)
             
         logdetjac = logdetjac + flow_logdet
@@ -395,11 +396,17 @@ class VAE_HSC(VAE):
             self.mean, 
             self.logvar)
         zt_from_q, logdet_from_q = self.flow_model(z0_from_q)
-        x_logit_from_q = self.decode(zt_from_q)
-        cross_ent_from_q = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=x_logit_from_q, 
-            labels=x)
-        logpx_z_from_q = -tf.reduce_sum(cross_ent_from_q, axis=[1, 2, 3])
+        x_dec_from_q = self.decode(zt_from_q)
+        if self.dataset == 'mnist' or self.dataset == 'mnist_dyn':
+            cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
+                logits=x_dec_from_q, 
+                labels=x)
+            logpx_z_from_q = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        elif self.dataset == 'fashion_mnist' or self.dataset == 'cifar10':
+            logpx_z_from_q = log_normal_pdf(x, 
+                x_dec_from_q, 
+                tf.math.log(self.likelihood_sigma**2), 
+                raxis=range(1, len(x.shape)))
         logpz_from_q = log_normal_pdf(zt_from_q, 0., 0.)
         logqz_x_from_q = log_normal_pdf(
             z0_from_q, self.mean, self.logvar) - logdet_from_q
@@ -460,10 +467,17 @@ class VAE_HSC(VAE):
             zt_S = tf.concat([self.current_state_batch, zt_Sm1], axis=0)
             logdet = tf.concat([-logdetinv, logdet_Sm1], axis=0)
             # Compute w as an S times batch_size-long vector
-            x_logit = self.decode(zt_S)
-            cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
-                logits=x_logit, labels=tf.tile(x, (S, 1, 1, 1)))
-            logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+            x_dec = self.decode(zt_S)
+            if self.dataset == 'mnist' or self.dataset == 'mnist_dyn':
+                cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
+                    logits=x_dec, 
+                    labels=tf.tile(x, (S, 1, 1, 1)))
+                logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+            elif self.dataset == 'fashion_mnist' or self.dataset == 'cifar10':
+                logpx_z = log_normal_pdf(tf.tile(x, (S, 1, 1, 1)), 
+                    x_dec, 
+                    tf.math.log(self.likelihood_sigma**2), 
+                    raxis=range(1, len(x.shape)))
             logpz = log_normal_pdf(zt_S, 0., 0.)
             logqz_x = -logdet + log_normal_pdf(
                 z0_S, 
@@ -487,10 +501,18 @@ class VAE_HSC(VAE):
 
         z0, _ = self.flow_model.inverse(zt)
         _, logdet = self.flow_model(z0)
-        x_logit = self.decode(zt)
-        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=x_logit, labels=tf.tile(x, (self.chains, 1, 1, 1)))
-        logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        x_dec = self.decode(zt)
+        if self.dataset == 'mnist' or self.dataset == 'mnist_dyn':
+            cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
+                logits=x_dec, 
+                labels=tf.tile(x, (self.chains, 1, 1, 1)))
+            logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        elif self.dataset == 'fashion_mnist' or self.dataset == 'cifar10':
+            logpx_z = log_normal_pdf(
+                tf.tile(x, (self.chains, 1, 1, 1)), 
+                x_dec, 
+                tf.math.log(self.likelihood_sigma**2), 
+                raxis=range(1, len(x.shape)))
         logqz_x = log_normal_pdf(z0, self.mean, self.logvar) - logdet
 
         loss_p = -tf.reduce_mean(logpx_z)
@@ -507,15 +529,25 @@ class VAE_HSC(VAE):
         mean, logvar = self.encode(x)
         z0 = self.reparameterize(mean, logvar)
         zt, logdet = self.flow_model(z0)
-        x_logit = self.decode(zt)
-        cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(logits=x_logit, labels=x)
-        logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        x_dec = self.decode(zt)
+        if self.dataset == 'mnist' or self.dataset == 'mnist_dyn':
+            cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(
+                logits=x_dec, 
+                labels=x)
+            logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
+        elif self.dataset == 'fashion_mnist' or self.dataset == 'cifar10':
+            logpx_z = log_normal_pdf(
+                x, 
+                x_dec, 
+                tf.math.log(self.likelihood_sigma**2), 
+                raxis=range(1, len(x.shape)))
         logpz = log_normal_pdf(zt, 0., 0.)
         logqz_x = log_normal_pdf(z0, mean, logvar) - logdet
         
         return -tf.reduce_mean(logpx_z + logpz - logqz_x)
     
     def train_step(self, x, optimizer_p, optimizer_q, idx):
+
         with tf.GradientTape(persistent=True) as tape:
                 
             loss_p, loss_q = self.compute_loss(x, idx)
@@ -612,8 +644,8 @@ class VAE_HSC(VAE):
                     name='shear')
             self.hmc_points = np.genfromtxt(load_path + 'hmc-points/hmc_points.csv', dtype='float32')
 
-        # If we don't load, we can do a warm-up and use the warmed-up encoder.
-        if warm_up:
+        # If we don't load, we do a warm-up and use the warmed-up encoder for NeutraHMC
+        if warm_up and load_path is None:
             os.makedirs('pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/warmed_up_encoder/')
             os.makedirs('pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/warmed_up_flow/')
             if self.num_flow > 0:
@@ -640,6 +672,7 @@ class VAE_HSC(VAE):
                 'pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/warmed_up_flow/flow')
             np.savetxt('pretrained/' + str(self.latent_dim) + '/' + self.tm_str + '/shearing_param.csv', self.shearing_param.numpy())
 
+            # End of warm up, we reload the initial decoder and be ready to start training
             self.decoder.load_weights(self.file_path + 'models/init_decoder/decoder')
 
         # Main section
@@ -683,13 +716,19 @@ class VAE_HSC(VAE):
                     # print('Loss p', round(self.loss_p.numpy(), 3), 'Loss q', round(self.loss_q.numpy(), 3))
 
             # Save generated images
+            if self.dataset == 'cifar10':
+                colored = True 
+            else:
+                colored = False
             if generation:
                 generate_images_from_images(self, test_sample,
+                    colored=colored,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
                 generate_images_from_random(self, random_vector_for_generation, 
+                    colored=colored,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
             # Save model
-            if epoch % 1 == 0 or epoch == epochs:
+            if epoch % 10 == 0 or epoch == epochs:
                 os.makedirs(self.file_path+'models/epoch_' + str(epoch) + '_encoder/')
                 os.makedirs(self.file_path+'models/epoch_' + str(epoch) + '_decoder/')
                 os.makedirs(self.file_path+'models/epoch_' + str(epoch) + '_shearing_param/')

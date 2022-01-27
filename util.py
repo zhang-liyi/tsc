@@ -64,29 +64,53 @@ def load_fashion_mnist(batch_size=32):
 
     return train_dataset, test_dataset
 
-def generate_images_from_images(model, test_sample, path=None):
+def load_cifar10(batch_size=32):
+    train_images = pd.read_pickle('data/cifar10_train.pickle')
+    test_images = pd.read_pickle('data/cifar10_test.pickle')
+    
+    train_size = 50000
+    test_size = 10000
+
+    train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
+                     .shuffle(train_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
+    test_dataset = (tf.data.Dataset.from_tensor_slices(test_images)
+                    .shuffle(test_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
+
+    return train_dataset, test_dataset
+
+def generate_images_from_images(model, test_sample, colored=False, path=None):
     mean, logvar = model.encode(test_sample)
     z = model.reparameterize(mean, logvar)
     z, _ = model.flow_model(z)
-    predictions = model.sample(z)
+    predictions = model.sample(z, apply_sigmoid=not colored)
     fig = plt.figure(figsize=(4, 4))
-    for i in range(predictions.shape[0]):
-        plt.subplot(4, 4, i + 1)
-        plt.imshow(predictions[i, :, :, 0], cmap='gray')
-        plt.axis('off')
-
+    if not colored:
+        for i in range(predictions.shape[0]):
+            plt.subplot(4, 4, i + 1)
+            plt.imshow(predictions[i, :, :, 0], cmap='gray')
+            plt.axis('off')
+    else:
+        for i in range(predictions.shape[0]):
+            plt.subplot(4, 4, i + 1)
+            plt.imshow((predictions[i,:,:,:]+1)/2)
+            plt.axis('off')
     if path is not None:
         plt.savefig(path)
         plt.close()
     
-def generate_images_from_random(model, rand_vec, path=None):
-    predictions = model.sample(rand_vec)
+def generate_images_from_random(model, rand_vec, colored=False, path=None):
+    predictions = model.sample(rand_vec, apply_sigmoid=not colored)
     fig = plt.figure(figsize=(4, 4))
-    for i in range(predictions.shape[0]):
-        plt.subplot(4, 4, i + 1)
-        plt.imshow(predictions[i, :, :, 0], cmap='gray')
-        plt.axis('off')
-
+    if not colored:
+        for i in range(predictions.shape[0]):
+            plt.subplot(4, 4, i + 1)
+            plt.imshow(predictions[i, :, :, 0], cmap='gray')
+            plt.axis('off')
+    else:
+        for i in range(predictions.shape[0]):
+            plt.subplot(4, 4, i + 1)
+            plt.imshow((predictions[i,:,:,:]+1)/2)
+            plt.axis('off')
     if path is not None:
         plt.savefig(path)
         plt.close()
