@@ -1,8 +1,9 @@
 # Transport Score Climbing: Variational Inference using Inclusive KL and Adaptive Neural Transport
 
 Packages used:
-* Tensorflow 2.3.0
-* Tensorflow-Probability 0.11.1
+* TensorFlow 2.3.0
+* TensorFlow-Probability 0.11.1
+* TensorFlow Addons
 
 To run:
 `python main.py --dataset=[funnel/banana/mnist/mnist_dyn/cifar10] --v_fam=[gaussian/flow] --space=[original/warped] --num_samp=xxx --epochs=xxx --lr=xxx --decay_rate=xxx --hmc_e=xxx --hmc_L=xxx --hmc_L_cap=xxx --cis=xxx --reinitialize_from_q=[true/false] --warm_up=[true/false]`
