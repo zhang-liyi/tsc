@@ -1,6 +1,7 @@
 import numpy as np
 import tensorflow as tf
 import tensorflow_addons as tfa
+import tensorflow_datasets as tfds
 import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
@@ -14,69 +15,61 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 
 
-def preprocess_images(images):
+def preprocess_mnist(images):
     images = images.reshape((images.shape[0], 28, 28, 1)) / 255.
     return np.where(images > .5, 1.0, 0.0).astype('float32')
 
-def load_mnist(batch_size=32, return_labels=False):
-    (train_images, train_labels), (test_images, test_labels) = tf.keras.datasets.mnist.load_data()
-    train_images = preprocess_images(train_images)
-    test_images = preprocess_images(test_images)
+def load_image_data(dataset, batch_size=32):
+    print('data processing...')
 
-    train_size = 60000
-    test_size = 10000
+    if dataset == 'mnist':
+        (train_images, train_labels), (test_images, test_labels) = tf.keras.datasets.mnist.load_data()
+        train_images = preprocess_mnist(train_images)
+        test_images = preprocess_mnist(test_images)
+        train_size = 60000
+        test_size = 10000
 
-    train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
-                     .shuffle(train_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
-    test_dataset = (tf.data.Dataset.from_tensor_slices(test_images)
-                    .shuffle(test_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
-
-    if not return_labels:
-        return train_dataset, test_dataset
     else:
-        return train_dataset, train_labels, test_dataset, test_labels
+        if dataset == 'mnist_dyn':
+            train_size = 60000
+            test_size = 10000
 
-def load_mnist_dyn(batch_size=32):
-    train_images = pd.read_pickle('data/mnist_dyn_train.pickle')
-    test_images = pd.read_pickle('data/mnist_dyn_test.pickle')
-    
-    train_size = 60000
-    test_size = 10000
+            ds_train, ds_test = tfds.load('binarized_mnist', split=['train', 'test'], shuffle_files=False)
+            ds_train_np = tfds.as_numpy(ds_train)
+            train_images = np.zeros((train_size, 28, 28, 1), dtype='float32')
+            ds_test_np = tfds.as_numpy(ds_test)
+            test_images = np.zeros((test_size, 28, 28, 1), dtype='float32')
 
-    train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
-                     .shuffle(train_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
-    test_dataset = (tf.data.Dataset.from_tensor_slices(test_images)
-                    .shuffle(test_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
+        elif dataset == 'cifar10':
 
-    return train_dataset, test_dataset
+            train_size = 50000
+            test_size = 10000
 
-def load_fashion_mnist(batch_size=32):
-    train_images = pd.read_pickle('data/fashion_mnist_train.pickle')
-    test_images = pd.read_pickle('data/fashion_mnist_test.pickle')
-    
-    train_size = 60000
-    test_size = 10000
+            ds_train, ds_test = tfds.load('cifar10', split=['train', 'test'], shuffle_files=False)
+            ds_train_np = tfds.as_numpy(ds_train)
+            train_images = np.zeros((train_size, 32, 32, 3), dtype='float32')
+            ds_test_np = tfds.as_numpy(ds_test)
+            test_images = np.zeros((test_size, 32, 32, 3), dtype='float32')
 
-    train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
-                     .shuffle(train_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
-    test_dataset = (tf.data.Dataset.from_tensor_slices(test_images)
-                    .shuffle(test_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
+        i = 0
+        for example in ds_train_np:
+            train_images[i,:,:,:] = example['image']
+            i += 1
+        i = 0
+        for example in ds_test_np:
+            test_images[i,:,:,:] = example['image']
+            i += 1
 
-    return train_dataset, test_dataset
-
-def load_cifar10(batch_size=32):
-    train_images = pd.read_pickle('data/cifar10_train.pickle')
-    test_images = pd.read_pickle('data/cifar10_test.pickle')
-    
-    train_size = 50000
-    test_size = 10000
+        if dataset == 'cifar10':
+            train_images = (train_images - 255/2)/(255/2)
+            test_images = (test_images - 255/2)/(255/2)
 
     train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
                      .shuffle(train_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
     test_dataset = (tf.data.Dataset.from_tensor_slices(test_images)
                     .shuffle(test_size, reshuffle_each_iteration=False, seed=0).batch(batch_size))
 
-    return train_dataset, test_dataset
+    return train_dataset, test_dataset, train_size, test_size
 
 def generate_images_from_images(model, test_sample, colored=False, path=None):
     mean, logvar = model.encode(test_sample)
@@ -98,7 +91,9 @@ def generate_images_from_images(model, test_sample, colored=False, path=None):
         plt.savefig(path)
         plt.close()
     
-def generate_images_from_random(model, rand_vec, colored=False, path=None):
+def generate_images_from_random(model, latent_dim, rand_vec=None, colored=False, path=None):
+    if rand_vec is None:
+        rand_vec = tfd.Sample(tfd.Normal(0., 1.), latent_dim).sample(16)
     predictions = model.sample(rand_vec, apply_sigmoid=not colored)
     fig = plt.figure(figsize=(4, 4))
     if not colored:

@@ -174,7 +174,8 @@ class VAE(tf.keras.Model):
                 generate_images_from_images(self, test_sample,
                     colored=colored,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
-                generate_images_from_random(self, random_vector_for_generation, 
+                generate_images_from_random(self, self.latent_dim,
+                    random_vector_for_generation, 
                     colored=colored,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
             # Save model
@@ -392,6 +393,7 @@ class VAE_HSC(VAE):
             self.hmc_points[idx:(idx+self.batch_size*self.chains), :] = zt.numpy()
 
     def get_loss_q_from_q_sample(self, x):
+        # Only used in NeutraHMC main training phase
         z0_from_q = self.reparameterize(
             self.mean, 
             self.logvar)
@@ -661,7 +663,8 @@ class VAE_HSC(VAE):
                 if generation:
                     generate_images_from_images(self, test_sample,
                         path=self.file_path + 'generated-images/pre-epoch-'+str(epoch)+'-from-images.png')
-                    generate_images_from_random(self, random_vector_for_generation, 
+                    generate_images_from_random(self, self.latent_dim, 
+                        random_vector_for_generation, 
                         path=self.file_path + 'generated-images/pre-epoch-'+str(epoch)+'-from-prior.png')
             # Save model
             self.encoder.save_weights(
@@ -724,7 +727,8 @@ class VAE_HSC(VAE):
                 generate_images_from_images(self, test_sample,
                     colored=colored,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-images.png')
-                generate_images_from_random(self, random_vector_for_generation, 
+                generate_images_from_random(self, self.latent_dim,
+                    random_vector_for_generation, 
                     colored=colored,
                     path=self.file_path + 'generated-images/epoch-'+str(epoch)+'-from-prior.png')
             # Save model

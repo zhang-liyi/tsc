@@ -2,7 +2,7 @@ import numpy as np
 import tensorflow as tf
 import argparse
 
-import util
+from util import *
 import models
 import models_vae
 
@@ -10,10 +10,10 @@ def parse_args():
     parser = argparse.ArgumentParser(
                         description='VI and HMC')
     parser.add_argument('--dataset',
-                        help='benchmark dataset to use (funnel / survey / mnist).',
+                        help='benchmark dataset to use (funnel / survey / mnist / minst_dyn / cifar10).',
                         default='mnist')
     parser.add_argument('--method',
-                        help='method, please choose from: {vi_klqp, vi_klpq, hmc, vae, vae_hsc}.',
+                        help='method, please choose from: {vi_klqp, vi_klpq, hmc, vae, vae_mcmc}.',
                         default='vi_klpq')
     parser.add_argument('--v_fam',
                         help='variational family, please choose from: {gaussian, flow, iaf} (the last two are the same here).',
@@ -128,7 +128,7 @@ def parse_args():
     parser.add_argument('--random_seed',
                        help='Random seed.',
                        type=int,
-                       default=42)
+                       default=0)
     args = parser.parse_args()
     return args
 
@@ -173,24 +173,9 @@ if args.method.lower() == 'hmc':
         hmc_L=args.hmc_L)
     model.run(load_path='results/checkpoints/iaf_qp', save=True, path=path)
 
-if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
+if args.method.lower() == 'vae' or args.method.lower() == 'vae_mcmc':
     batch_size = args.batch_size
-    if args.dataset.lower() == 'mnist':
-        train_size = 60000
-        test_size = 10000
-        train_dataset, test_dataset = util.load_mnist(batch_size)
-    elif args.dataset.lower() == 'mnist_dyn':
-        train_size = 60000
-        test_size = 10000
-        train_dataset, test_dataset = util.load_mnist_dyn(batch_size)
-    elif args.dataset.lower() == 'fashion_mnist':
-        train_size = 60000
-        test_size = 10000
-        train_dataset, test_dataset = util.load_fashion_mnist(batch_size)
-    elif args.dataset.lower() == 'cifar10':
-        train_size = 50000
-        test_size = 10000
-        train_dataset, test_dataset = util.load_cifar10(batch_size)
+    train_dataset, test_dataset, train_size, test_size = load_image_data(args.dataset, batch_size)
     random_vector_for_generation = np.genfromtxt(
         'data/vae_random_vector_' + str(args.latent_dim) + '.csv').astype('float32')
     for test_batch in test_dataset.take(1):
@@ -209,7 +194,7 @@ if args.method.lower() == 'vae' or args.method.lower() == 'vae_hsc':
             load_path=load_path, load_epoch=args.load_epoch,
             test_sample=test_sample, random_vector_for_generation=random_vector_for_generation, generation=True)
 
-    if args.method.lower() == 'vae_hsc':
+    if args.method.lower() == 'vae_mcmc':
         model = models_vae.VAE_HSC(
             args.latent_dim, 
             num_flow=args.vae_num_flow,
