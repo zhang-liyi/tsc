@@ -15,6 +15,6 @@ Some explanations:
 * `--num_samp` refers to number of samples used in VI. It defaults at 1, and when > 1, does IWAE for VAE experiments.
 * `--decay_rate` refers to decay rate in inverse time decay learning schedule, which is only used in non-VAE experiments.
 * `--cis` defaults at 0. For VAE-related methods, if `cis` is > 0, then the program does CIS-MSC with `cis` as number of importance samples.
-* `--reinitialize_from_q=[true/false]` refers to whether we reinitialize HMC chain from q in every epoch in VAE experiments. 'True' means TSC; 'false' means NeutraHMC.
+* `--reinitialize_from_q=[true/false]` refers to whether we reinitialize HMC chain from q in every epoch in VAE experiments. 'True' means NeutraHMC; 'false' means TSC.
 
 To run survey dataset, one should use `survey_data.ipynb`.
