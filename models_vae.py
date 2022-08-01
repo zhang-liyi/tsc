@@ -339,9 +339,9 @@ class VAE_HSC(VAE):
         smallest_accept = np.min(self.is_accepted)
         average_accept = np.mean(self.is_accepted)
         if smallest_accept < 0.25 or average_accept < self.target_accept:
-            self.hmc_e = self.hmc_e * 0.97
+            self.hmc_e = self.hmc_e * 0.995
         else:
-            self.hmc_e = min(self.hmc_e * 1.03, 1.)
+            self.hmc_e = min(self.hmc_e * 1.005, 1.)
         self.hmc_L = min(int(1 / self.hmc_e)+1, self.hmc_L_cap)
 
         if self.hmc_e_differs:
